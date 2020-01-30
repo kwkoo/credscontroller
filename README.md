@@ -17,7 +17,7 @@ This project is based on Kelsey Hightower's Kubernetes - Vault integration [proo
 
 # Motivation
 
-There is a need to improve how credentials are managed in Kubernetes. Credentials are supposed to be managed with secretes but secrets have some limitations. here is a secret threat model and relative needed security controls:
+There is a need to improve how credentials are managed in Kubernetes. Credentials are supposed to be managed with secrets but secrets have some limitations. here is a secret threat model and relative needed security controls:
 
 1. Secrets must be stored securely. Secrets should be encrypted when at rest.
 2. Secrets must be transmitted securely among the platform components and the final consumer. Secrets should be encrypted when in transit.
@@ -44,16 +44,31 @@ This project support 2 use cases:
 | reading secrets in use from the node  | ok  | no  | no  |
 
 # Requirements
-You need the [Vault CLI](https://www.vaultproject.io/docs/install/) installed on your machine.
+
+You need the [Vault CLI](https://releases.hashicorp.com/vault/0.11.1/) installed on your machine.
 
 # Create a new project
+
 ```
 oc new-project vault-controller
 ```
 
+# Fix startup script in vault image
+
+```
+oc new-build \
+  --name=vault-fixed \
+  --binary \
+  --strategy=docker \
+  --to=vault-fixed
+  
+oc start-build vault-fixed \
+  --follow \
+  --from-dir=vault-fixed/
+```
+
 # Install Vault
 ```
-oc adm policy add-scc-to-user anyuid -z default
 oc create configmap vault-config --from-file=vault-config=./openshift/vault-config.json
 oc create -f ./openshift/vault.yaml
 oc create route reencrypt vault --port=8200 --service=vault
@@ -77,26 +92,46 @@ We will assume that the KEYS environment variable contains the key necessary to 
 
 For example:
 
-`export KEYS=tjgv5s7M4CtMeUz92dU9jV3EudPawgNz6euEnciZoFs=`
+```
+export KEYS=tjgv5s7M4CtMeUz92dU9jV3EudPawgNz6euEnciZoFs=
 
-
-`export ROOT_TOKEN=1487cceb-f05d-63be-3e24-d08e429c760c`
-
-
+export ROOT_TOKEN=1487cceb-f05d-63be-3e24-d08e429c760c
+```
 
 ```
 vault operator unseal -tls-skip-verify $KEYS
 ```
 
+# Build the Vault Controller
+
+```
+oc new-build \
+  --binary \
+  -e IMPORT_URL=github.com/raffaelespazzoli/credscontroller \
+  --docker-image=docker.io/kwkoo/go-toolset-7-centos7:1.13 \
+  --name=credscontroller
+
+oc start-build \
+  credscontroller \
+  --follow \
+  --from-dir=.
+```
+
 # Install Vault Controller
 
 Deploy the vault controller
+
 ```
 oc create secret generic vault-controller --from-literal vault-token=$ROOT_TOKEN
+
 oc adm policy add-cluster-role-to-user view system:serviceaccount:vault-controller:default
+
 oc create -f ./openshift/vault-controller.yaml
 ```
-You can now start using this orchestration to provision secrets. 
+
+You can now start using this orchestration to provision secrets.
+
+
 
 # Examples
 
@@ -118,6 +153,7 @@ See also the following examples:
 # Enable kuberntes native Vault integration
 
 configure kubernetes backend
+
 ```
 oc create sa vault-auth
 oc adm policy add-cluster-role-to-user system:auth-delegator -z vault-auth
@@ -132,6 +168,7 @@ rm ca.crt
 vault write -tls-skip-verify auth/kubernetes/role/demo bound_service_account_names=default bound_service_account_namespaces='*' policies=default ttl=1h 
 ```
 test the default account
+
 ```
 secret=`oc describe sa default | grep 'Tokens:' | awk '{print $2}'`
 token=`oc describe secret $secret | grep 'token:' | awk '{print $2}'`

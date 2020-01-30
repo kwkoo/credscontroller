@@ -27,8 +27,9 @@ spec:
     spec:
       containers:
       - name: vault-controller
-        image: "raffaelespazzoli/credscontroller:0.0.1"
+        image: ''
         args:
+        - /opt/app-root/gobinary
         - vault-controller
         imagePullPolicy: Always
         ports:
@@ -64,3 +65,12 @@ spec:
       - name: vault-controller-cert
         secret:
           secretName: vault-controller-cert
+  triggers:
+  - imageChangeParams:
+      automatic: true
+      containerNames:
+      - vault-controller
+      from:
+        kind: ImageStreamTag
+        name: credscontroller:latest
+    type: ImageChange

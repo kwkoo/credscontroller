@@ -15,13 +15,15 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/hashicorp/vault/api"
 	"io"
-	kapi "k8s.io/client-go/pkg/api"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/hashicorp/vault/api"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func tokenRequestHandler(w io.Writer, r *http.Request) (int, error) {
@@ -38,7 +40,7 @@ func tokenRequestHandler(w io.Writer, r *http.Request) (int, error) {
 	}
 
 	//use kube client set to lookup the pod details by name
-	pod, err := kubernetesClientSet.Pods(namespace).Get(name)
+	pod, err := kubernetesClientSet.CoreV1().Pods(namespace).Get(name, metav1.GetOptions{})
 	if err != nil {
 		return 500, fmt.Errorf("error during namespace/pod (%s)/(%s) lookup %s", namespace, name, err)
 	}
@@ -49,31 +51,6 @@ func tokenRequestHandler(w io.Writer, r *http.Request) (int, error) {
 		return 500, fmt.Errorf("error missing or empty pod vaultproject.io/role annotation (%s)", name)
 	}
 
-	//	// Use kubectl proxy to lookup the pod details by name
-	//	u := fmt.Sprintf("http://127.0.0.1:8001/api/v1/namespaces/%s/pods/%s", namespace, name)
-	//	resp, err := http.Get(u)
-	//	if err != nil {
-	//		return 500, fmt.Errorf("error during pod (%s) lookup %s", name, err)
-	//	}
-	//	data, err := ioutil.ReadAll(resp.Body)
-	//	if err != nil {
-	//		return 500, fmt.Errorf("error parsing pod (%s) details: %s", name, err)
-	//	}
-	//
-	//	var pod Pod
-	//	err = json.Unmarshal(data, &pod)
-	//	if err != nil {
-	//		return 500, fmt.Errorf("error parsing pod (%s) details: %s", name, err)
-	//	}
-	//
-	//	if pod.Status.PodIP == "" {
-	//		return 412, fmt.Errorf("error missing or empty pod IP (%s)", name)
-	//	}
-	//
-	//	policies := pod.Metadata.Annotations["vaultproject.io/policies"]
-	//	if policies == "" {
-	//		return 500, fmt.Errorf("error missing or empty pod vaultproject.io/role annotation (%s)", name)
-	//	}
 	ttl := pod.Annotations["vaultproject.io/ttl"]
 	if ttl == "" {
 		ttl = "72h"
@@ -104,21 +81,19 @@ func tokenRequestHandler(w io.Writer, r *http.Request) (int, error) {
 		return 500, fmt.Errorf("error parsing wrapped token for pod (%s), error: %s", name, err)
 	}
 
-	var initContainers []kapi.Container
-	err = json.Unmarshal([]byte(pod.Annotations["pod.alpha.kubernetes.io/init-containers"]), &initContainers)
-	if err != nil {
-		log.Fatalf("Failed to Unmarshall: %s", err)
+	if len(pod.Spec.InitContainers) == 0 {
+		return 500, errors.New("pod has no init containers")
 	}
 
-	portStr := strconv.Itoa(int(initContainers[0].Ports[0].ContainerPort))
+	initContainer := pod.Spec.InitContainers[0]
+	if len(initContainer.Ports) == 0 {
+		return 500, fmt.Errorf("init container %s has no ports section", initContainer.Name)
+	}
+
+	portStr := strconv.Itoa(int(initContainer.Ports[0].ContainerPort))
+
 	log.Printf("Container Port in Init Container: %s", portStr)
 
-	//for some reason this doesn work...
-	//	log.Debug("pod.Name: ", pod.Name)
-	//	log.Debug("len pod.Spec.InitContainers: ", len(pod.Spec.InitContainers))
-	//	log.Debug("len pod.Spec.InitContainers[0].Ports: ", len(pod.Spec.InitContainers[0].Ports))
-	//	log.Debug("pod.Spec.InitContainers[0].Ports[0].ContainerPort: ", pod.Spec.InitContainers[0].Ports[0].ContainerPort)
-	//	port := pod.Spec.InitContainers[0].Ports[0].ContainerPort
 	go pushWrappedTokenTo(pod.Status.PodIP, portStr, &wrappedToken)
 
 	return 202, nil
