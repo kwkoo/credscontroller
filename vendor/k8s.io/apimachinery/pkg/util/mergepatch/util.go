@@ -21,7 +21,7 @@ import (
 	"reflect"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/ghodss/yaml"
+	"sigs.k8s.io/yaml"
 )
 
 // PreconditionFunc asserts that an incompatible change is not present within a patch.
@@ -86,6 +86,9 @@ func toYAML(v interface{}) (string, error) {
 // different values in any key. All keys are required to be strings. Since patches of the
 // same Type have congruent keys, this is valid for multiple patch types. This method
 // supports JSON merge patch semantics.
+//
+// NOTE: Numbers with different types (e.g. int(0) vs int64(0)) will be detected as conflicts.
+//       Make sure the unmarshaling of left and right are consistent (e.g. use the same library).
 func HasConflicts(left, right interface{}) (bool, error) {
 	switch typedLeft := left.(type) {
 	case map[string]interface{}:
@@ -94,9 +97,11 @@ func HasConflicts(left, right interface{}) (bool, error) {
 			for key, leftValue := range typedLeft {
 				rightValue, ok := typedRight[key]
 				if !ok {
-					return false, nil
+					continue
 				}
-				return HasConflicts(leftValue, rightValue)
+				if conflict, err := HasConflicts(leftValue, rightValue); err != nil || conflict {
+					return conflict, err
+				}
 			}
 
 			return false, nil
@@ -111,14 +116,16 @@ func HasConflicts(left, right interface{}) (bool, error) {
 			}
 
 			for i := range typedLeft {
-				return HasConflicts(typedLeft[i], typedRight[i])
+				if conflict, err := HasConflicts(typedLeft[i], typedRight[i]); err != nil || conflict {
+					return conflict, err
+				}
 			}
 
 			return false, nil
 		default:
 			return true, nil
 		}
-	case string, float64, bool, int, int64, nil:
+	case string, float64, bool, int64, nil:
 		return !reflect.DeepEqual(left, right), nil
 	default:
 		return true, fmt.Errorf("unknown type: %v", reflect.TypeOf(left))

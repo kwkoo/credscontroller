@@ -17,9 +17,10 @@ limitations under the License.
 package cache
 
 import (
+	"errors"
 	"sync"
 
-	"k8s.io/client-go/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 // PopProcessFunc is passed to Pop() method of Queue interface.
@@ -32,6 +33,9 @@ type ErrRequeue struct {
 	// Err is returned by the Pop function
 	Err error
 }
+
+// ErrFIFOClosed used when FIFO is closed
+var ErrFIFOClosed = errors.New("DeltaFIFO: manipulating with closed queue")
 
 func (e ErrRequeue) Error() string {
 	if e.Err == nil {
@@ -56,11 +60,14 @@ type Queue interface {
 	// has since been added.
 	AddIfNotPresent(interface{}) error
 
-	// Return true if the first batch of items has been popped
+	// HasSynced returns true if the first batch of items has been popped
 	HasSynced() bool
+
+	// Close queue
+	Close()
 }
 
-// Helper function for popping from Queue.
+// Pop is helper function for popping from Queue.
 // WARNING: Do NOT use this function in non-test code to avoid races
 // unless you really really really really know what you are doing.
 func Pop(queue Queue) interface{} {
@@ -100,13 +107,27 @@ type FIFO struct {
 	// keyFunc is used to make the key used for queued item insertion and retrieval, and
 	// should be deterministic.
 	keyFunc KeyFunc
+
+	// Indication the queue is closed.
+	// Used to indicate a queue is closed so a control loop can exit when a queue is empty.
+	// Currently, not used to gate any of CRED operations.
+	closed     bool
+	closedLock sync.Mutex
 }
 
 var (
 	_ = Queue(&FIFO{}) // FIFO is a Queue
 )
 
-// Return true if an Add/Update/Delete/AddIfNotPresent are called first,
+// Close the queue.
+func (f *FIFO) Close() {
+	f.closedLock.Lock()
+	defer f.closedLock.Unlock()
+	f.closed = true
+	f.cond.Broadcast()
+}
+
+// HasSynced returns true if an Add/Update/Delete/AddIfNotPresent are called first,
 // or an Update called first but the first batch of items inserted by Replace() has been popped
 func (f *FIFO) HasSynced() bool {
 	f.lock.Lock()
@@ -149,7 +170,7 @@ func (f *FIFO) AddIfNotPresent(obj interface{}) error {
 	return nil
 }
 
-// addIfNotPresent assumes the fifo lock is already held and adds the the provided
+// addIfNotPresent assumes the fifo lock is already held and adds the provided
 // item to the queue under id if it does not already exist.
 func (f *FIFO) addIfNotPresent(id string, obj interface{}) {
 	f.populated = true
@@ -222,6 +243,16 @@ func (f *FIFO) GetByKey(key string) (item interface{}, exists bool, err error) {
 	return item, exists, nil
 }
 
+// IsClosed checks if the queue is closed
+func (f *FIFO) IsClosed() bool {
+	f.closedLock.Lock()
+	defer f.closedLock.Unlock()
+	if f.closed {
+		return true
+	}
+	return false
+}
+
 // Pop waits until an item is ready and processes it. If multiple items are
 // ready, they are returned in the order in which they were added/updated.
 // The item is removed from the queue (and the store) before it is processed,
@@ -233,6 +264,13 @@ func (f *FIFO) Pop(process PopProcessFunc) (interface{}, error) {
 	defer f.lock.Unlock()
 	for {
 		for len(f.queue) == 0 {
+			// When the queue is empty, invocation of Pop() is blocked until new item is enqueued.
+			// When Close() is called, the f.closed is set and the condition is broadcasted.
+			// Which causes this loop to continue and return from the Pop().
+			if f.IsClosed() {
+				return nil, ErrFIFOClosed
+			}
+
 			f.cond.Wait()
 		}
 		id := f.queue[0]
@@ -260,7 +298,7 @@ func (f *FIFO) Pop(process PopProcessFunc) (interface{}, error) {
 // after calling this function. f's queue is reset, too; upon return, it
 // will contain the items in the map, in no particular order.
 func (f *FIFO) Replace(list []interface{}, resourceVersion string) error {
-	items := map[string]interface{}{}
+	items := make(map[string]interface{}, len(list))
 	for _, item := range list {
 		key, err := f.keyFunc(item)
 		if err != nil {
