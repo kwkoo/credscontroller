@@ -10,15 +10,23 @@ Create a policy that allows the spring-example role to read only from the spring
 
 ```
 export VAULT_TOKEN=$ROOT_TOKEN
-vault policy write -tls-skip-verify spring-example ./examples/spring-example/spring-example.hcl 
+
+vault policy write \
+  -tls-skip-verify \
+  spring-example \
+  ./examples/spring-example/spring-example.hcl
 ```
 
 Create a secret for the application to consume
+
 ```
-vault write -tls-skip-verify secret/spring-example password=pwd 
+vault write \
+  -tls-skip-verify \
+  secret/spring-example \
+  password=pwd 
 ```
 
-Before you create a new project for the example app, we need to allow the example app to pull the vault-controller imagestream (you can safely ignore the warning message):
+Before you create a new project for the example app, we need to allow the example app to pull the `vault-controller` image (you can safely ignore the warning message):
 
 ```
 oc policy add-role-to-user \
@@ -31,9 +39,12 @@ Build the application
 
 ```
 oc new-project spring-example
+
 oc new-build redhat-openjdk18-openshift:1.4~https://github.com/raffaelespazzoli/credscontroller \
   --context-dir=examples/spring-example \
   --name spring-example
+  
+oc logs -f bc/spring-example
 ```
 
 Join the network with vault-controller (skip this step if your cluster is not configured with the multi-tenant network):
@@ -46,6 +57,7 @@ Deploy the spring example app
 
 ```
 oc create -f ./examples/spring-example/spring-example.yaml
+
 oc expose svc spring-example
 ```
 
@@ -53,5 +65,6 @@ Now you should be able to call a service that returns the secret
 
 ```
 export SPRING_EXAMPLE_ADDR=http://`oc get route | grep -m1 spring | awk '{print $2}'`
+
 curl $SPRING_EXAMPLE_ADDR/secret
 ```

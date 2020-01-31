@@ -74,7 +74,7 @@ spec:
       - vault
       from:
         kind: ImageStreamTag
-        name: vault-fixed:latest
+        name: vault-openshift:latest
     type: ImageChange
 ---
 kind: PersistentVolumeClaim

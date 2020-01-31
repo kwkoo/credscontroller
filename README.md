@@ -1,5 +1,11 @@
 # Vault-based Credential Management Workflow
 
+**Note:**
+
+* This was forked from <https://github.com/raffaelespazzoli/credscontroller>.
+* This repo has been updated to work with OpenShift 3.11.
+* It is still using an old version of Vault (0.11.1).
+
 This project implements the workflow illustrated in the following picture
 
 ![Vault Controller Flow](./media/vault-controller-raf.png)
@@ -53,31 +59,48 @@ You need the [Vault CLI](https://releases.hashicorp.com/vault/0.11.1/) installed
 oc new-project vault-controller
 ```
 
-# Fix startup script in vault image
+# Modify vault image to run on OpenShift
 
 ```
 oc new-build \
-  --name=vault-fixed \
+  --name=vault-openshift \
   --binary \
   --strategy=docker \
-  --to=vault-fixed
+  --to=vault-openshift:0.11.1
   
-oc start-build vault-fixed \
+oc start-build vault-openshift \
   --follow \
-  --from-dir=vault-fixed/
+  --from-dir=openshift/vault-openshift/
+
+oc tag \
+  vault-openshift:0.11.1 \
+  vault-openshift:latest
 ```
 
 # Install Vault
+
 ```
-oc create configmap vault-config --from-file=vault-config=./openshift/vault-config.json
+oc create configmap vault-config \
+  --from-file=vault-config=./openshift/vault-config.json
+
 oc create -f ./openshift/vault.yaml
-oc create route reencrypt vault --port=8200 --service=vault
+
+oc create route reencrypt vault \
+  --port=8200 \
+  --service=vault
 ```
+
 # Initialize Vault
+
 ```
 export VAULT_ADDR=https://`oc get route | grep -m1 vault | awk '{print $2}'`
-vault operator init -tls-skip-verify -key-shares=1 -key-threshold=1
+
+vault operator init \
+  -tls-skip-verify \
+  -key-shares=1 \
+  -key-threshold=1
 ```
+
 Save the generated key and token. 
 
 # Unseal Vault.
@@ -88,17 +111,15 @@ Don't try to automate this step, this is manual by design.
 
 You can make the initial seal stronger by increasing the number of keys. 
 
-We will assume that the KEYS environment variable contains the key necessary to unseal the vault and that ROOT_TOKEN contains the root token.
+We will assume that the `KEYS` environment variable contains the key necessary to unseal the vault and that `ROOT_TOKEN` contains the root token.
 
-For example:
+For example (Note: do not use the values for `KEYS` and `ROOT_TOKEN` below - use the values that you copied after initializing the vault):
 
 ```
 export KEYS=tjgv5s7M4CtMeUz92dU9jV3EudPawgNz6euEnciZoFs=
 
 export ROOT_TOKEN=1487cceb-f05d-63be-3e24-d08e429c760c
-```
 
-```
 vault operator unseal -tls-skip-verify $KEYS
 ```
 
@@ -114,7 +135,7 @@ oc new-build \
 oc start-build \
   credscontroller \
   --follow \
-  --from-dir=.
+  --from-dir=credscontroller/
 ```
 
 # Install Vault Controller
