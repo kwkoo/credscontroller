@@ -1,12 +1,13 @@
 package radius
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
-	"github.com/hashicorp/vault/helper/policyutil"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathUsersList(b *backend) *framework.Path {
@@ -19,6 +20,10 @@ func pathUsersList(b *backend) *framework.Path {
 
 		HelpSynopsis:    pathUserHelpSyn,
 		HelpDescription: pathUserHelpDesc,
+		DisplayAttrs: &framework.DisplayAttributes{
+			Navigation: true,
+			ItemType:   "User",
+		},
 	}
 }
 
@@ -32,7 +37,7 @@ func pathUsers(b *backend) *framework.Path {
 			},
 
 			"policies": &framework.FieldSchema{
-				Type:        framework.TypeString,
+				Type:        framework.TypeCommaStringSlice,
 				Description: "Comma-separated list of policies associated to the user.",
 			},
 		},
@@ -48,11 +53,15 @@ func pathUsers(b *backend) *framework.Path {
 
 		HelpSynopsis:    pathUserHelpSyn,
 		HelpDescription: pathUserHelpDesc,
+		DisplayAttrs: &framework.DisplayAttributes{
+			Action:   "Create",
+			ItemType: "User",
+		},
 	}
 }
 
-func (b *backend) userExistenceCheck(req *logical.Request, data *framework.FieldData) (bool, error) {
-	userEntry, err := b.user(req.Storage, data.Get("name").(string))
+func (b *backend) userExistenceCheck(ctx context.Context, req *logical.Request, data *framework.FieldData) (bool, error) {
+	userEntry, err := b.user(ctx, req.Storage, data.Get("name").(string))
 	if err != nil {
 		return false, err
 	}
@@ -60,12 +69,12 @@ func (b *backend) userExistenceCheck(req *logical.Request, data *framework.Field
 	return userEntry != nil, nil
 }
 
-func (b *backend) user(s logical.Storage, username string) (*UserEntry, error) {
+func (b *backend) user(ctx context.Context, s logical.Storage, username string) (*UserEntry, error) {
 	if username == "" {
 		return nil, fmt.Errorf("missing username")
 	}
 
-	entry, err := s.Get("user/" + strings.ToLower(username))
+	entry, err := s.Get(ctx, "user/"+strings.ToLower(username))
 	if err != nil {
 		return nil, err
 	}
@@ -81,9 +90,8 @@ func (b *backend) user(s logical.Storage, username string) (*UserEntry, error) {
 	return &result, nil
 }
 
-func (b *backend) pathUserDelete(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	err := req.Storage.Delete("user/" + d.Get("name").(string))
+func (b *backend) pathUserDelete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	err := req.Storage.Delete(ctx, "user/"+d.Get("name").(string))
 	if err != nil {
 		return nil, err
 	}
@@ -91,9 +99,8 @@ func (b *backend) pathUserDelete(
 	return nil, nil
 }
 
-func (b *backend) pathUserRead(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	user, err := b.user(req.Storage, d.Get("name").(string))
+func (b *backend) pathUserRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	user, err := b.user(ctx, req.Storage, d.Get("name").(string))
 	if err != nil {
 		return nil, err
 	}
@@ -108,13 +115,12 @@ func (b *backend) pathUserRead(
 	}, nil
 }
 
-func (b *backend) pathUserWrite(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *backend) pathUserWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 
-	var policies = policyutil.ParsePolicies(d.Get("policies").(string))
+	var policies = policyutil.ParsePolicies(d.Get("policies"))
 	for _, policy := range policies {
 		if policy == "root" {
-			return logical.ErrorResponse("root policy cannot be granted by an authentication backend"), nil
+			return logical.ErrorResponse("root policy cannot be granted by an auth method"), nil
 		}
 	}
 
@@ -125,16 +131,15 @@ func (b *backend) pathUserWrite(
 	if err != nil {
 		return nil, err
 	}
-	if err := req.Storage.Put(entry); err != nil {
+	if err := req.Storage.Put(ctx, entry); err != nil {
 		return nil, err
 	}
 
 	return nil, nil
 }
 
-func (b *backend) pathUserList(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	users, err := req.Storage.List("user/")
+func (b *backend) pathUserList(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	users, err := req.Storage.List(ctx, "user/")
 	if err != nil {
 		return nil, err
 	}

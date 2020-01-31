@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"github.com/gocql/gocql"
-	"github.com/hashicorp/vault/helper/certutil"
-	"github.com/hashicorp/vault/helper/tlsutil"
-	"github.com/hashicorp/vault/logical"
+	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/vault/sdk/helper/certutil"
+	"github.com/hashicorp/vault/sdk/helper/tlsutil"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 // Query templates a query for us.
@@ -39,7 +40,7 @@ func createSession(cfg *sessionConfig, s logical.Storage) (*gocql.Session, error
 		var tlsConfig *tls.Config
 		if len(cfg.Certificate) > 0 || len(cfg.IssuingCA) > 0 {
 			if len(cfg.Certificate) > 0 && len(cfg.PrivateKey) == 0 {
-				return nil, fmt.Errorf("Found certificate for TLS authentication but no private key")
+				return nil, fmt.Errorf("found certificate for TLS authentication but no private key")
 			}
 
 			certBundle := &certutil.CertBundle{}
@@ -53,12 +54,12 @@ func createSession(cfg *sessionConfig, s logical.Storage) (*gocql.Session, error
 
 			parsedCertBundle, err := certBundle.ToParsedCertBundle()
 			if err != nil {
-				return nil, fmt.Errorf("failed to parse certificate bundle: %s", err)
+				return nil, errwrap.Wrapf("failed to parse certificate bundle: {{err}}", err)
 			}
 
 			tlsConfig, err = parsedCertBundle.GetTLSConfig(certutil.TLSClient)
 			if err != nil || tlsConfig == nil {
-				return nil, fmt.Errorf("failed to get TLS configuration: tlsConfig:%#v err:%v", tlsConfig, err)
+				return nil, errwrap.Wrapf(fmt.Sprintf("failed to get TLS configuration: tlsConfig: %#v; {{err}}", tlsConfig), err)
 			}
 			tlsConfig.InsecureSkipVerify = cfg.InsecureTLS
 
@@ -76,19 +77,19 @@ func createSession(cfg *sessionConfig, s logical.Storage) (*gocql.Session, error
 		}
 
 		clusterConfig.SslOpts = &gocql.SslOptions{
-			Config: *tlsConfig,
+			Config: tlsConfig,
 		}
 	}
 
 	session, err := clusterConfig.CreateSession()
 	if err != nil {
-		return nil, fmt.Errorf("Error creating session: %s", err)
+		return nil, errwrap.Wrapf("error creating session: {{err}}", err)
 	}
 
 	// Verify the info
 	err = session.Query(`LIST USERS`).Exec()
 	if err != nil {
-		return nil, fmt.Errorf("Error validating connection info: %s", err)
+		return nil, errwrap.Wrapf("error validating connection info: {{err}}", err)
 	}
 
 	return session, nil

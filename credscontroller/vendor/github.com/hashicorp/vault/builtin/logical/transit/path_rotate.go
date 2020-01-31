@@ -1,8 +1,11 @@
 package transit
 
 import (
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"context"
+
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/keysutil"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func (b *backend) pathRotate() *framework.Path {
@@ -24,25 +27,28 @@ func (b *backend) pathRotate() *framework.Path {
 	}
 }
 
-func (b *backend) pathRotateWrite(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *backend) pathRotateWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	name := d.Get("name").(string)
 
 	// Get the policy
-	p, lock, err := b.lm.GetPolicyExclusive(req.Storage, name)
-	if lock != nil {
-		defer lock.Unlock()
-	}
+	p, _, err := b.lm.GetPolicy(ctx, keysutil.PolicyRequest{
+		Storage: req.Storage,
+		Name:    name,
+	}, b.GetRandomReader())
 	if err != nil {
 		return nil, err
 	}
 	if p == nil {
 		return logical.ErrorResponse("key not found"), logical.ErrInvalidRequest
 	}
+	if !b.System().CachingDisabled() {
+		p.Lock(true)
+	}
 
 	// Rotate the policy
-	err = p.Rotate(req.Storage)
+	err = p.Rotate(ctx, req.Storage, b.GetRandomReader())
 
+	p.Unlock()
 	return nil, err
 }
 

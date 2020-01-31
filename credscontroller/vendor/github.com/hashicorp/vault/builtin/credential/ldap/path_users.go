@@ -1,12 +1,13 @@
 package ldap
 
 import (
+	"context"
 	"strings"
 
-	"github.com/hashicorp/vault/helper/policyutil"
-	"github.com/hashicorp/vault/helper/strutil"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
+	"github.com/hashicorp/vault/sdk/helper/strutil"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathUsersList(b *backend) *framework.Path {
@@ -19,6 +20,10 @@ func pathUsersList(b *backend) *framework.Path {
 
 		HelpSynopsis:    pathUserHelpSyn,
 		HelpDescription: pathUserHelpDesc,
+		DisplayAttrs: &framework.DisplayAttributes{
+			Navigation: true,
+			ItemType:   "User",
+		},
 	}
 }
 
@@ -26,18 +31,18 @@ func pathUsers(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: `users/(?P<name>.+)`,
 		Fields: map[string]*framework.FieldSchema{
-			"name": &framework.FieldSchema{
+			"name": {
 				Type:        framework.TypeString,
 				Description: "Name of the LDAP user.",
 			},
 
-			"groups": &framework.FieldSchema{
-				Type:        framework.TypeString,
+			"groups": {
+				Type:        framework.TypeCommaStringSlice,
 				Description: "Comma-separated list of additional groups associated with the user.",
 			},
 
-			"policies": &framework.FieldSchema{
-				Type:        framework.TypeString,
+			"policies": {
+				Type:        framework.TypeCommaStringSlice,
 				Description: "Comma-separated list of policies associated with the user.",
 			},
 		},
@@ -50,11 +55,15 @@ func pathUsers(b *backend) *framework.Path {
 
 		HelpSynopsis:    pathUserHelpSyn,
 		HelpDescription: pathUserHelpDesc,
+		DisplayAttrs: &framework.DisplayAttributes{
+			Action:   "Create",
+			ItemType: "User",
+		},
 	}
 }
 
-func (b *backend) User(s logical.Storage, n string) (*UserEntry, error) {
-	entry, err := s.Get("user/" + n)
+func (b *backend) User(ctx context.Context, s logical.Storage, n string) (*UserEntry, error) {
+	entry, err := s.Get(ctx, "user/"+n)
 	if err != nil {
 		return nil, err
 	}
@@ -70,9 +79,8 @@ func (b *backend) User(s logical.Storage, n string) (*UserEntry, error) {
 	return &result, nil
 }
 
-func (b *backend) pathUserDelete(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	err := req.Storage.Delete("user/" + d.Get("name").(string))
+func (b *backend) pathUserDelete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	err := req.Storage.Delete(ctx, "user/"+d.Get("name").(string))
 	if err != nil {
 		return nil, err
 	}
@@ -80,9 +88,21 @@ func (b *backend) pathUserDelete(
 	return nil, nil
 }
 
-func (b *backend) pathUserRead(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	user, err := b.User(req.Storage, d.Get("name").(string))
+func (b *backend) pathUserRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	username := d.Get("name").(string)
+
+	cfg, err := b.Config(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return logical.ErrorResponse("ldap backend not configured"), nil
+	}
+	if !*cfg.CaseSensitiveNames {
+		username = strings.ToLower(username)
+	}
+
+	user, err := b.User(ctx, req.Storage, username)
 	if err != nil {
 		return nil, err
 	}
@@ -93,42 +113,57 @@ func (b *backend) pathUserRead(
 	return &logical.Response{
 		Data: map[string]interface{}{
 			"groups":   strings.Join(user.Groups, ","),
-			"policies": strings.Join(user.Policies, ","),
+			"policies": user.Policies,
 		},
 	}, nil
 }
 
-func (b *backend) pathUserWrite(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	name := d.Get("name").(string)
-	groups := strutil.ParseDedupAndSortStrings(d.Get("groups").(string), ",")
-	policies := policyutil.ParsePolicies(d.Get("policies").(string))
+func (b *backend) pathUserWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	lowercaseGroups := false
+	username := d.Get("name").(string)
+
+	cfg, err := b.Config(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return logical.ErrorResponse("ldap backend not configured"), nil
+	}
+	if !*cfg.CaseSensitiveNames {
+		username = strings.ToLower(username)
+		lowercaseGroups = true
+	}
+
+	groups := strutil.RemoveDuplicates(d.Get("groups").([]string), lowercaseGroups)
+	policies := policyutil.ParsePolicies(d.Get("policies"))
 	for i, g := range groups {
 		groups[i] = strings.TrimSpace(g)
 	}
 
 	// Store it
-	entry, err := logical.StorageEntryJSON("user/"+name, &UserEntry{
+	entry, err := logical.StorageEntryJSON("user/"+username, &UserEntry{
 		Groups:   groups,
 		Policies: policies,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := req.Storage.Put(entry); err != nil {
+	if err := req.Storage.Put(ctx, entry); err != nil {
 		return nil, err
 	}
 
 	return nil, nil
 }
 
-func (b *backend) pathUserList(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	users, err := req.Storage.List("user/")
+func (b *backend) pathUserList(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	keys, err := logical.CollectKeysWithPrefix(ctx, req.Storage, "user/")
 	if err != nil {
 		return nil, err
 	}
-	return logical.ListResponse(users), nil
+	for i := range keys {
+		keys[i] = strings.TrimPrefix(keys[i], "user/")
+	}
+	return logical.ListResponse(keys), nil
 }
 
 type UserEntry struct {
@@ -137,7 +172,7 @@ type UserEntry struct {
 }
 
 const pathUserHelpSyn = `
-Manage additional groups for users allowed to authenticate.
+Manage users allowed to authenticate.
 `
 
 const pathUserHelpDesc = `

@@ -5,7 +5,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
+
+	"github.com/hashicorp/vault/sdk/helper/consts"
 )
 
 func init() {
@@ -33,6 +36,15 @@ func TestDefaultConfig_envvar(t *testing.T) {
 
 	if token := client.Token(); token != "testing" {
 		t.Fatalf("bad: %s", token)
+	}
+}
+
+func TestClientDefaultHttpClient(t *testing.T) {
+	_, err := NewClient(&Config{
+		HttpClient: http.DefaultClient,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -85,6 +97,30 @@ func TestClientToken(t *testing.T) {
 	}
 }
 
+func TestClientBadToken(t *testing.T) {
+	handler := func(w http.ResponseWriter, req *http.Request) {}
+
+	config, ln := testHTTPServer(t, http.HandlerFunc(handler))
+	defer ln.Close()
+
+	client, err := NewClient(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	client.SetToken("foo")
+	_, err = client.RawRequest(client.NewRequest("PUT", "/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.SetToken("foo\u007f")
+	_, err = client.RawRequest(client.NewRequest("PUT", "/"))
+	if err == nil || !strings.Contains(err.Error(), "printable") {
+		t.Fatalf("expected error due to bad token")
+	}
+}
+
 func TestClientRedirect(t *testing.T) {
 	primary := func(w http.ResponseWriter, req *http.Request) {
 		w.Write([]byte("test"))
@@ -129,19 +165,19 @@ func TestClientEnvSettings(t *testing.T) {
 	oldCAPath := os.Getenv(EnvVaultCAPath)
 	oldClientCert := os.Getenv(EnvVaultClientCert)
 	oldClientKey := os.Getenv(EnvVaultClientKey)
-	oldSkipVerify := os.Getenv(EnvVaultInsecure)
+	oldSkipVerify := os.Getenv(EnvVaultSkipVerify)
 	oldMaxRetries := os.Getenv(EnvVaultMaxRetries)
 	os.Setenv(EnvVaultCACert, cwd+"/test-fixtures/keys/cert.pem")
 	os.Setenv(EnvVaultCAPath, cwd+"/test-fixtures/keys")
 	os.Setenv(EnvVaultClientCert, cwd+"/test-fixtures/keys/cert.pem")
 	os.Setenv(EnvVaultClientKey, cwd+"/test-fixtures/keys/key.pem")
-	os.Setenv(EnvVaultInsecure, "true")
+	os.Setenv(EnvVaultSkipVerify, "true")
 	os.Setenv(EnvVaultMaxRetries, "5")
 	defer os.Setenv(EnvVaultCACert, oldCACert)
 	defer os.Setenv(EnvVaultCAPath, oldCAPath)
 	defer os.Setenv(EnvVaultClientCert, oldClientCert)
 	defer os.Setenv(EnvVaultClientKey, oldClientKey)
-	defer os.Setenv(EnvVaultInsecure, oldSkipVerify)
+	defer os.Setenv(EnvVaultSkipVerify, oldSkipVerify)
 	defer os.Setenv(EnvVaultMaxRetries, oldMaxRetries)
 
 	config := DefaultConfig()
@@ -153,10 +189,188 @@ func TestClientEnvSettings(t *testing.T) {
 	if len(tlsConfig.RootCAs.Subjects()) == 0 {
 		t.Fatalf("bad: expected a cert pool with at least one subject")
 	}
-	if len(tlsConfig.Certificates) != 1 {
-		t.Fatalf("bad: expected client tls config to have a client certificate")
+	if tlsConfig.GetClientCertificate == nil {
+		t.Fatalf("bad: expected client tls config to have a certificate getter")
 	}
 	if tlsConfig.InsecureSkipVerify != true {
 		t.Fatalf("bad: %v", tlsConfig.InsecureSkipVerify)
+	}
+}
+
+func TestClientDeprecatedEnvSettings(t *testing.T) {
+	oldInsecure := os.Getenv(EnvVaultInsecure)
+	os.Setenv(EnvVaultInsecure, "true")
+	defer os.Setenv(EnvVaultInsecure, oldInsecure)
+
+	config := DefaultConfig()
+	if err := config.ReadEnvironment(); err != nil {
+		t.Fatalf("error reading environment: %v", err)
+	}
+
+	tlsConfig := config.HttpClient.Transport.(*http.Transport).TLSClientConfig
+	if tlsConfig.InsecureSkipVerify != true {
+		t.Fatalf("bad: %v", tlsConfig.InsecureSkipVerify)
+	}
+}
+
+func TestClientEnvNamespace(t *testing.T) {
+	var seenNamespace string
+	handler := func(w http.ResponseWriter, req *http.Request) {
+		seenNamespace = req.Header.Get(consts.NamespaceHeaderName)
+	}
+	config, ln := testHTTPServer(t, http.HandlerFunc(handler))
+	defer ln.Close()
+
+	oldVaultNamespace := os.Getenv(EnvVaultNamespace)
+	defer os.Setenv(EnvVaultNamespace, oldVaultNamespace)
+	os.Setenv(EnvVaultNamespace, "test")
+
+	client, err := NewClient(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	_, err = client.RawRequest(client.NewRequest("GET", "/"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if seenNamespace != "test" {
+		t.Fatalf("Bad: %s", seenNamespace)
+	}
+}
+
+func TestParsingRateAndBurst(t *testing.T) {
+	var (
+		correctFormat                    = "400:400"
+		observedRate, observedBurst, err = parseRateLimit(correctFormat)
+		expectedRate, expectedBurst      = float64(400), 400
+	)
+	if err != nil {
+		t.Error(err)
+	}
+	if expectedRate != observedRate {
+		t.Errorf("Expected rate %v but found %v", expectedRate, observedRate)
+	}
+	if expectedBurst != observedBurst {
+		t.Errorf("Expected burst %v but found %v", expectedBurst, observedBurst)
+	}
+}
+
+func TestParsingRateOnly(t *testing.T) {
+	var (
+		correctFormat                    = "400"
+		observedRate, observedBurst, err = parseRateLimit(correctFormat)
+		expectedRate, expectedBurst      = float64(400), 400
+	)
+	if err != nil {
+		t.Error(err)
+	}
+	if expectedRate != observedRate {
+		t.Errorf("Expected rate %v but found %v", expectedRate, observedRate)
+	}
+	if expectedBurst != observedBurst {
+		t.Errorf("Expected burst %v but found %v", expectedBurst, observedBurst)
+	}
+}
+
+func TestParsingErrorCase(t *testing.T) {
+	var incorrectFormat = "foobar"
+	var _, _, err = parseRateLimit(incorrectFormat)
+	if err == nil {
+		t.Error("Expected error, found no error")
+	}
+}
+
+func TestClientTimeoutSetting(t *testing.T) {
+	oldClientTimeout := os.Getenv(EnvVaultClientTimeout)
+	os.Setenv(EnvVaultClientTimeout, "10")
+	defer os.Setenv(EnvVaultClientTimeout, oldClientTimeout)
+	config := DefaultConfig()
+	config.ReadEnvironment()
+	_, err := NewClient(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (rt roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return rt(r)
+}
+
+func TestClientNonTransportRoundTripper(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripperFunc(http.DefaultTransport.RoundTrip),
+	}
+
+	_, err := NewClient(&Config{
+		HttpClient: client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClone(t *testing.T) {
+	client1, err1 := NewClient(nil)
+	if err1 != nil {
+		t.Fatalf("NewClient failed: %v", err1)
+	}
+	client2, err2 := client1.Clone()
+	if err2 != nil {
+		t.Fatalf("Clone failed: %v", err2)
+	}
+
+	_ = client2
+}
+
+func TestSetHeadersRaceSafe(t *testing.T) {
+	client, err1 := NewClient(nil)
+	if err1 != nil {
+		t.Fatalf("NewClient failed: %v", err1)
+	}
+
+	start := make(chan interface{})
+	done := make(chan interface{})
+
+	testPairs := map[string]string{
+		"soda":    "rootbeer",
+		"veggie":  "carrots",
+		"fruit":   "apples",
+		"color":   "red",
+		"protein": "egg",
+	}
+
+	for key, value := range testPairs {
+		tmpKey := key
+		tmpValue := value
+		go func() {
+			<-start
+			// This test fails if here, you replace client.AddHeader(tmpKey, tmpValue) with:
+			// 	headerCopy := client.Header()
+			// 	headerCopy.AddHeader(tmpKey, tmpValue)
+			// 	client.SetHeader(headerCopy)
+			client.AddHeader(tmpKey, tmpValue)
+			done <- true
+		}()
+	}
+
+	// Start everyone at once.
+	close(start)
+
+	// Wait until everyone is done.
+	for i := 0; i < len(testPairs); i++ {
+		<-done
+	}
+
+	// Check that all the test pairs are in the resulting
+	// headers.
+	resultingHeaders := client.Headers()
+	for key, value := range testPairs {
+		if resultingHeaders.Get(key) != value {
+			t.Fatal("expected " + value + " for " + key)
+		}
 	}
 }

@@ -1,14 +1,17 @@
 package github
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"strings"
 
 	"github.com/google/go-github/github"
-	"github.com/hashicorp/vault/helper/policyutil"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/errwrap"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/cidrutil"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathLogin(b *backend) *framework.Path {
@@ -22,18 +25,17 @@ func pathLogin(b *backend) *framework.Path {
 		},
 
 		Callbacks: map[logical.Operation]framework.OperationFunc{
-			logical.UpdateOperation: b.pathLogin,
+			logical.UpdateOperation:         b.pathLogin,
+			logical.AliasLookaheadOperation: b.pathLoginAliasLookahead,
 		},
 	}
 }
 
-func (b *backend) pathLogin(
-	req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-
+func (b *backend) pathLoginAliasLookahead(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 	token := data.Get("token").(string)
 
 	var verifyResp *verifyCredentialsResp
-	if verifyResponse, resp, err := b.verifyCredentials(req, token); err != nil {
+	if verifyResponse, resp, err := b.verifyCredentials(ctx, req, token); err != nil {
 		return nil, err
 	} else if resp != nil {
 		return resp, nil
@@ -41,38 +43,64 @@ func (b *backend) pathLogin(
 		verifyResp = verifyResponse
 	}
 
-	config, err := b.Config(req.Storage)
-	if err != nil {
-		return nil, err
-	}
-
-	ttl, _, err := b.SanitizeTTLStr(config.TTL.String(), config.MaxTTL.String())
-	if err != nil {
-		return logical.ErrorResponse(fmt.Sprintf("error sanitizing TTLs: %s", err)), nil
-	}
-
 	return &logical.Response{
 		Auth: &logical.Auth{
-			InternalData: map[string]interface{}{
-				"token": token,
-			},
-			Policies: verifyResp.Policies,
-			Metadata: map[string]string{
-				"username": *verifyResp.User.Login,
-				"org":      *verifyResp.Org.Login,
-			},
-			DisplayName: *verifyResp.User.Login,
-			LeaseOptions: logical.LeaseOptions{
-				TTL:       ttl,
-				Renewable: true,
+			Alias: &logical.Alias{
+				Name: *verifyResp.User.Login,
 			},
 		},
 	}, nil
 }
 
-func (b *backend) pathLoginRenew(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *backend) pathLogin(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	token := data.Get("token").(string)
 
+	var verifyResp *verifyCredentialsResp
+	if verifyResponse, resp, err := b.verifyCredentials(ctx, req, token); err != nil {
+		return nil, err
+	} else if resp != nil {
+		return resp, nil
+	} else {
+		verifyResp = verifyResponse
+	}
+
+	auth := &logical.Auth{
+		InternalData: map[string]interface{}{
+			"token": token,
+		},
+		Metadata: map[string]string{
+			"username": *verifyResp.User.Login,
+			"org":      *verifyResp.Org.Login,
+		},
+		DisplayName: *verifyResp.User.Login,
+		Alias: &logical.Alias{
+			Name: *verifyResp.User.Login,
+		},
+	}
+	verifyResp.Config.PopulateTokenAuth(auth)
+
+	// Add in configured policies from user/group mapping
+	if len(verifyResp.Policies) > 0 {
+		auth.Policies = append(auth.Policies, verifyResp.Policies...)
+	}
+
+	resp := &logical.Response{
+		Auth: auth,
+	}
+
+	for _, teamName := range verifyResp.TeamNames {
+		if teamName == "" {
+			continue
+		}
+		resp.Auth.GroupAliases = append(resp.Auth.GroupAliases, &logical.Alias{
+			Name: teamName,
+		})
+	}
+
+	return resp, nil
+}
+
+func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	if req.Auth == nil {
 		return nil, fmt.Errorf("request auth was nil")
 	}
@@ -84,32 +112,57 @@ func (b *backend) pathLoginRenew(
 	token := tokenRaw.(string)
 
 	var verifyResp *verifyCredentialsResp
-	if verifyResponse, resp, err := b.verifyCredentials(req, token); err != nil {
+	if verifyResponse, resp, err := b.verifyCredentials(ctx, req, token); err != nil {
 		return nil, err
 	} else if resp != nil {
 		return resp, nil
 	} else {
 		verifyResp = verifyResponse
 	}
-	if !policyutil.EquivalentPolicies(verifyResp.Policies, req.Auth.Policies) {
+	if !policyutil.EquivalentPolicies(verifyResp.Policies, req.Auth.TokenPolicies) {
 		return nil, fmt.Errorf("policies do not match")
 	}
 
-	config, err := b.Config(req.Storage)
-	if err != nil {
-		return nil, err
+	resp := &logical.Response{Auth: req.Auth}
+	resp.Auth.Period = verifyResp.Config.TokenPeriod
+	resp.Auth.TTL = verifyResp.Config.TokenTTL
+	resp.Auth.MaxTTL = verifyResp.Config.TokenMaxTTL
+
+	// Remove old aliases
+	resp.Auth.GroupAliases = nil
+
+	for _, teamName := range verifyResp.TeamNames {
+		resp.Auth.GroupAliases = append(resp.Auth.GroupAliases, &logical.Alias{
+			Name: teamName,
+		})
 	}
-	return framework.LeaseExtend(config.TTL, config.MaxTTL, b.System())(req, d)
+
+	return resp, nil
 }
 
-func (b *backend) verifyCredentials(req *logical.Request, token string) (*verifyCredentialsResp, *logical.Response, error) {
-	config, err := b.Config(req.Storage)
+func (b *backend) verifyCredentials(ctx context.Context, req *logical.Request, token string) (*verifyCredentialsResp, *logical.Response, error) {
+	config, err := b.Config(ctx, req.Storage)
 	if err != nil {
 		return nil, nil, err
 	}
+	if config == nil {
+		return nil, logical.ErrorResponse("configuration has not been set"), nil
+	}
+
+	// Check for a CIDR match.
+	if len(config.TokenBoundCIDRs) > 0 {
+		if req.Connection == nil {
+			b.Logger().Warn("token bound CIDRs found but no connection information available for validation")
+			return nil, nil, logical.ErrPermissionDenied
+		}
+		if !cidrutil.RemoteAddrIsOk(req.Connection.RemoteAddr, config.TokenBoundCIDRs) {
+			return nil, nil, logical.ErrPermissionDenied
+		}
+	}
+
 	if config.Organization == "" {
 		return nil, logical.ErrorResponse(
-			"configure the github credential backend first"), nil
+			"organization not found in configuration"), nil
 	}
 
 	client, err := b.Client(token)
@@ -120,13 +173,13 @@ func (b *backend) verifyCredentials(req *logical.Request, token string) (*verify
 	if config.BaseURL != "" {
 		parsedURL, err := url.Parse(config.BaseURL)
 		if err != nil {
-			return nil, nil, fmt.Errorf("Successfully parsed base_url when set but failing to parse now: %s", err)
+			return nil, nil, errwrap.Wrapf("successfully parsed base_url when set but failing to parse now: {{err}}", err)
 		}
 		client.BaseURL = parsedURL
 	}
 
 	// Get the user
-	user, _, err := client.Users.Get("")
+	user, _, err := client.Users.Get(ctx, "")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -140,7 +193,7 @@ func (b *backend) verifyCredentials(req *logical.Request, token string) (*verify
 
 	var allOrgs []*github.Organization
 	for {
-		orgs, resp, err := client.Organizations.List("", orgOpt)
+		orgs, resp, err := client.Organizations.List(ctx, "", orgOpt)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -152,7 +205,7 @@ func (b *backend) verifyCredentials(req *logical.Request, token string) (*verify
 	}
 
 	for _, o := range allOrgs {
-		if strings.ToLower(*o.Login) == strings.ToLower(config.Organization) {
+		if strings.EqualFold(*o.Login, config.Organization) {
 			org = o
 			break
 		}
@@ -170,7 +223,7 @@ func (b *backend) verifyCredentials(req *logical.Request, token string) (*verify
 
 	var allTeams []*github.Team
 	for {
-		teams, resp, err := client.Organizations.ListUserTeams(teamOpt)
+		teams, resp, err := client.Teams.ListUserTeams(ctx, teamOpt)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -194,27 +247,33 @@ func (b *backend) verifyCredentials(req *logical.Request, token string) (*verify
 		}
 	}
 
-	groupPoliciesList, err := b.TeamMap.Policies(req.Storage, teamNames...)
+	groupPoliciesList, err := b.TeamMap.Policies(ctx, req.Storage, teamNames...)
 
 	if err != nil {
 		return nil, nil, err
 	}
 
-	userPoliciesList, err := b.UserMap.Policies(req.Storage, []string{*user.Login}...)
+	userPoliciesList, err := b.UserMap.Policies(ctx, req.Storage, []string{*user.Login}...)
 
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return &verifyCredentialsResp{
-		User:     user,
-		Org:      org,
-		Policies: append(groupPoliciesList, userPoliciesList...),
+		User:      user,
+		Org:       org,
+		Policies:  append(groupPoliciesList, userPoliciesList...),
+		TeamNames: teamNames,
+		Config:    config,
 	}, nil, nil
 }
 
 type verifyCredentialsResp struct {
-	User     *github.User
-	Org      *github.Organization
-	Policies []string
+	User      *github.User
+	Org       *github.Organization
+	Policies  []string
+	TeamNames []string
+
+	// This is just a cache to send back to the caller
+	Config *config
 }

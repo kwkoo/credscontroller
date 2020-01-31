@@ -1,10 +1,10 @@
 package audit
 
 import (
+	"context"
 	"io"
 
-	"github.com/hashicorp/vault/helper/salt"
-	"github.com/hashicorp/vault/logical"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 // Formatter is an interface that is responsible for formating a
@@ -13,13 +13,12 @@ import (
 //
 // It is recommended that you pass data through Hash prior to formatting it.
 type Formatter interface {
-	FormatRequest(io.Writer, FormatterConfig, *logical.Auth, *logical.Request, error) error
-	FormatResponse(io.Writer, FormatterConfig, *logical.Auth, *logical.Request, *logical.Response, error) error
+	FormatRequest(context.Context, io.Writer, FormatterConfig, *logical.LogInput) error
+	FormatResponse(context.Context, io.Writer, FormatterConfig, *logical.LogInput) error
 }
 
 type FormatterConfig struct {
 	Raw          bool
-	Salt         *salt.Salt
 	HMACAccessor bool
 
 	// This should only ever be used in a testing context

@@ -1,18 +1,23 @@
 package cassandra
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/gocql/gocql"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 // Factory creates a new backend
-func Factory(conf *logical.BackendConfig) (logical.Backend, error) {
-	return Backend().Setup(conf)
+func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
+	b := Backend()
+	if err := b.Setup(ctx, conf); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 // Backend contains the base information for the backend's functionality
@@ -20,6 +25,12 @@ func Backend() *backend {
 	var b backend
 	b.Backend = &framework.Backend{
 		Help: strings.TrimSpace(backendHelp),
+
+		PathsSpecial: &logical.Paths{
+			SealWrapStorage: []string{
+				"config/connection",
+			},
+		},
 
 		Paths: []*framework.Path{
 			pathConfigConnection(&b),
@@ -31,9 +42,12 @@ func Backend() *backend {
 			secretCreds(&b),
 		},
 
-		Clean: func() {
+		Invalidate: b.invalidate,
+
+		Clean: func(_ context.Context) {
 			b.ResetDB(nil)
 		},
+		BackendType: logical.TypeLogical,
 	}
 
 	return &b
@@ -64,7 +78,7 @@ type sessionConfig struct {
 }
 
 // DB returns the database connection.
-func (b *backend) DB(s logical.Storage) (*gocql.Session, error) {
+func (b *backend) DB(ctx context.Context, s logical.Storage) (*gocql.Session, error) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
@@ -73,13 +87,12 @@ func (b *backend) DB(s logical.Storage) (*gocql.Session, error) {
 		return b.session, nil
 	}
 
-	entry, err := s.Get("config/connection")
+	entry, err := s.Get(ctx, "config/connection")
 	if err != nil {
 		return nil, err
 	}
 	if entry == nil {
-		return nil,
-			fmt.Errorf("Configure the DB connection with config/connection first")
+		return nil, fmt.Errorf("configure the DB connection with config/connection first")
 	}
 
 	config := &sessionConfig{}
@@ -105,6 +118,13 @@ func (b *backend) ResetDB(newSession *gocql.Session) {
 	}
 
 	b.session = newSession
+}
+
+func (b *backend) invalidate(_ context.Context, key string) {
+	switch key {
+	case "config/connection":
+		b.ResetDB(nil)
+	}
 }
 
 const backendHelp = `

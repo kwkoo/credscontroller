@@ -4,7 +4,7 @@
 
 * This was forked from <https://github.com/raffaelespazzoli/credscontroller>.
 * This repo has been updated to work with OpenShift 3.11.
-* It is still using an old version of Vault (0.11.1).
+* It has been updated to use Vault v1.3.2.
 
 This project implements the workflow illustrated in the following picture
 
@@ -51,7 +51,7 @@ This project support 2 use cases:
 
 # Requirements
 
-You need the [Vault CLI](https://releases.hashicorp.com/vault/0.11.1/) installed on your machine.
+You need the [Vault CLI](https://releases.hashicorp.com/vault/1.3.2/) installed on your machine.
 
 # Create a new project
 
@@ -66,14 +66,14 @@ oc new-build \
   --name=vault-openshift \
   --binary \
   --strategy=docker \
-  --to=vault-openshift:0.11.1
+  --to=vault-openshift:1.3.2
   
 oc start-build vault-openshift \
   --follow \
   --from-dir=openshift/vault-openshift/
 
 oc tag \
-  vault-openshift:0.11.1 \
+  vault-openshift:1.3.2 \
   vault-openshift:latest
 ```
 

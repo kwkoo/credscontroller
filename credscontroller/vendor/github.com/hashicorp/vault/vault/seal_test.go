@@ -1,27 +1,31 @@
 package vault
 
 import (
+	"context"
 	"reflect"
 	"testing"
 )
 
+// TestDefaultSeal_Config exercises Shamir SetBarrierConfig and BarrierConfig.
+// Note that this is a little questionable, because we're doing an init and
+// unseal, then changing the barrier config using an internal function instead
+// of an API.  In other words if your change break this test, it might be more
+// the test's fault than your changes.
 func TestDefaultSeal_Config(t *testing.T) {
-	bc, _ := TestSealDefConfigs()
-	// Change these to non-default values to ensure we are seeing the real
-	// config we set
-	bc.SecretShares = 4
-	bc.SecretThreshold = 2
-
+	bc := &SealConfig{
+		SecretShares:    4,
+		SecretThreshold: 2,
+	}
 	core, _, _ := TestCoreUnsealed(t)
 
-	defSeal := &DefaultSeal{}
+	defSeal := NewDefaultSeal(nil)
 	defSeal.SetCore(core)
-	err := defSeal.SetBarrierConfig(bc)
+	err := defSeal.SetBarrierConfig(context.Background(), bc)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	newBc, err := defSeal.BarrierConfig()
+	newBc, err := defSeal.BarrierConfig(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,9 +34,9 @@ func TestDefaultSeal_Config(t *testing.T) {
 	}
 
 	// Now, test without the benefit of the cached value in the seal
-	defSeal = &DefaultSeal{}
+	defSeal = NewDefaultSeal(nil)
 	defSeal.SetCore(core)
-	newBc, err = defSeal.BarrierConfig()
+	newBc, err = defSeal.BarrierConfig(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

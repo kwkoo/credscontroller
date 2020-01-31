@@ -6,6 +6,14 @@ The below picture shows the workflow.
 
 You need to have Vault and Vault-Controller installed as explained [here](../../README.md)
 
+Enable the kv secrets engine
+
+```
+vault secrets enable \
+  -tls-skip-verify \
+  -path=secret kv
+```
+
 Create a policy that allows the spring-example role to read only from the spring-example generic backend
 
 ```
@@ -20,10 +28,10 @@ vault policy write \
 Create a secret for the application to consume
 
 ```
-vault write \
+vault kv put \
   -tls-skip-verify \
   secret/spring-example \
-  password=pwd 
+  password=pwd
 ```
 
 Before you create a new project for the example app, we need to allow the example app to pull the `vault-controller` image (you can safely ignore the warning message):

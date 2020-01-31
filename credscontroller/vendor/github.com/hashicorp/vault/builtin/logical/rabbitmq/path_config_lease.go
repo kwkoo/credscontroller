@@ -1,11 +1,12 @@
 package rabbitmq
 
 import (
+	"context"
 	"time"
 
 	"github.com/fatih/structs"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathConfigLease(b *backend) *framework.Path {
@@ -35,7 +36,7 @@ func pathConfigLease(b *backend) *framework.Path {
 }
 
 // Sets the lease configuration parameters
-func (b *backend) pathLeaseUpdate(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *backend) pathLeaseUpdate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	entry, err := logical.StorageEntryJSON("config/lease", &configLease{
 		TTL:    time.Second * time.Duration(d.Get("ttl").(int)),
 		MaxTTL: time.Second * time.Duration(d.Get("max_ttl").(int)),
@@ -43,7 +44,7 @@ func (b *backend) pathLeaseUpdate(req *logical.Request, d *framework.FieldData) 
 	if err != nil {
 		return nil, err
 	}
-	if err := req.Storage.Put(entry); err != nil {
+	if err := req.Storage.Put(ctx, entry); err != nil {
 		return nil, err
 	}
 
@@ -51,8 +52,8 @@ func (b *backend) pathLeaseUpdate(req *logical.Request, d *framework.FieldData) 
 }
 
 // Returns the lease configuration parameters
-func (b *backend) pathLeaseRead(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	lease, err := b.Lease(req.Storage)
+func (b *backend) pathLeaseRead(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	lease, err := b.Lease(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}

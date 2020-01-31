@@ -4,12 +4,13 @@
 package duo
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 
 	"github.com/duosecurity/duo_api_golang/authapi"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 // DuoPaths returns path functions to configure Duo.
@@ -31,14 +32,14 @@ func DuoRootPaths() []string {
 // DuoHandler interacts with the Duo Auth API to authenticate a user
 // login request. If successful, the original response from the login
 // backend is returned.
-func DuoHandler(req *logical.Request, d *framework.FieldData, resp *logical.Response) (
+func DuoHandler(ctx context.Context, req *logical.Request, d *framework.FieldData, resp *logical.Response) (
 	*logical.Response, error) {
-	duoConfig, err := GetDuoConfig(req)
+	duoConfig, err := GetDuoConfig(ctx, req)
 	if err != nil || duoConfig == nil {
 		return logical.ErrorResponse("Could not load Duo configuration"), nil
 	}
 
-	duoAuthClient, err := GetDuoAuthClient(req, duoConfig)
+	duoAuthClient, err := GetDuoAuthClient(ctx, req, duoConfig)
 	if err != nil {
 		return logical.ErrorResponse(err.Error()), nil
 	}

@@ -1,6 +1,7 @@
 package radius
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -8,10 +9,12 @@ import (
 	"time"
 
 	"layeh.com/radius"
+	. "layeh.com/radius/rfc2865"
 
-	"github.com/hashicorp/vault/helper/policyutil"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/cidrutil"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathLogin(b *backend) *framework.Path {
@@ -35,7 +38,8 @@ func pathLogin(b *backend) *framework.Path {
 		},
 
 		Callbacks: map[logical.Operation]framework.OperationFunc{
-			logical.UpdateOperation: b.pathLogin,
+			logical.UpdateOperation:         b.pathLogin,
+			logical.AliasLookaheadOperation: b.pathLoginAliasLookahead,
 		},
 
 		HelpSynopsis:    pathLoginSyn,
@@ -43,23 +47,56 @@ func pathLogin(b *backend) *framework.Path {
 	}
 }
 
-func (b *backend) pathLogin(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *backend) pathLoginAliasLookahead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	username := d.Get("username").(string)
+	if username == "" {
+		return nil, fmt.Errorf("missing username")
+	}
+
+	return &logical.Response{
+		Auth: &logical.Auth{
+			Alias: &logical.Alias{
+				Name: username,
+			},
+		},
+	}, nil
+}
+
+func (b *backend) pathLogin(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	cfg, err := b.Config(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return logical.ErrorResponse("radius backend not configured"), nil
+	}
+
+	// Check for a CIDR match.
+	if len(cfg.TokenBoundCIDRs) > 0 {
+		if req.Connection == nil {
+			b.Logger().Warn("token bound CIDRs found but no connection information available for validation")
+			return nil, logical.ErrPermissionDenied
+		}
+		if !cidrutil.RemoteAddrIsOk(req.Connection.RemoteAddr, cfg.TokenBoundCIDRs) {
+			return nil, logical.ErrPermissionDenied
+		}
+	}
+
 	username := d.Get("username").(string)
 	password := d.Get("password").(string)
 
 	if username == "" {
 		username = d.Get("urlusername").(string)
 		if username == "" {
-			return logical.ErrorResponse("username cannot be emtpy"), nil
+			return logical.ErrorResponse("username cannot be empty"), nil
 		}
 	}
 
 	if password == "" {
-		return logical.ErrorResponse("password cannot be emtpy"), nil
+		return logical.ErrorResponse("password cannot be empty"), nil
 	}
 
-	policies, resp, err := b.RadiusLogin(req, username, password)
+	policies, resp, err := b.RadiusLogin(ctx, req, username, password)
 	// Handle an internal error
 	if err != nil {
 		return nil, err
@@ -71,8 +108,7 @@ func (b *backend) pathLogin(
 		}
 	}
 
-	resp.Auth = &logical.Auth{
-		Policies: policies,
+	auth := &logical.Auth{
 		Metadata: map[string]string{
 			"username": username,
 			"policies": strings.Join(policies, ","),
@@ -81,16 +117,28 @@ func (b *backend) pathLogin(
 			"password": password,
 		},
 		DisplayName: username,
-		LeaseOptions: logical.LeaseOptions{
-			Renewable: true,
+		Alias: &logical.Alias{
+			Name: username,
 		},
 	}
+	cfg.PopulateTokenAuth(auth)
+
+	resp.Auth = auth
+	if policies != nil {
+		resp.Auth.Policies = append(resp.Auth.Policies, policies...)
+	}
+
 	return resp, nil
 }
 
-func (b *backend) pathLoginRenew(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	var err error
+func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	cfg, err := b.Config(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return logical.ErrorResponse("radius backend not configured"), nil
+	}
 
 	username := req.Auth.Metadata["username"]
 	password := req.Auth.InternalData["password"].(string)
@@ -98,21 +146,27 @@ func (b *backend) pathLoginRenew(
 	var resp *logical.Response
 	var loginPolicies []string
 
-	loginPolicies, resp, err = b.RadiusLogin(req, username, password)
+	loginPolicies, resp, err = b.RadiusLogin(ctx, req, username, password)
 	if err != nil || (resp != nil && resp.IsError()) {
 		return resp, err
 	}
+	finalPolicies := cfg.TokenPolicies
+	if loginPolicies != nil {
+		finalPolicies = append(finalPolicies, loginPolicies...)
+	}
 
-	if !policyutil.EquivalentPolicies(loginPolicies, req.Auth.Policies) {
+	if !policyutil.EquivalentPolicies(finalPolicies, req.Auth.TokenPolicies) {
 		return nil, fmt.Errorf("policies have changed, not renewing")
 	}
 
-	return framework.LeaseExtend(0, 0, b.System())(req, d)
+	req.Auth.Period = cfg.TokenPeriod
+	req.Auth.TTL = cfg.TokenTTL
+	req.Auth.MaxTTL = cfg.TokenMaxTTL
+	return &logical.Response{Auth: req.Auth}, nil
 }
 
-func (b *backend) RadiusLogin(req *logical.Request, username string, password string) ([]string, *logical.Response, error) {
-
-	cfg, err := b.Config(req)
+func (b *backend) RadiusLogin(ctx context.Context, req *logical.Request, username string, password string) ([]string, *logical.Response, error) {
+	cfg, err := b.Config(ctx, req)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -123,15 +177,21 @@ func (b *backend) RadiusLogin(req *logical.Request, username string, password st
 	hostport := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
 	packet := radius.New(radius.CodeAccessRequest, []byte(cfg.Secret))
-	packet.Add("User-Name", username)
-	packet.Add("User-Password", password)
-	packet.Add("NAS-Port", uint32(cfg.NasPort))
+	UserName_SetString(packet, username)
+	UserPassword_SetString(packet, password)
+	if cfg.NasIdentifier != "" {
+		NASIdentifier_AddString(packet, cfg.NasIdentifier)
+	}
+	packet.Add(5, radius.NewInteger(uint32(cfg.NasPort)))
 
 	client := radius.Client{
-		DialTimeout: time.Duration(cfg.DialTimeout) * time.Second,
-		ReadTimeout: time.Duration(cfg.ReadTimeout) * time.Second,
+		Dialer: net.Dialer{
+			Timeout: time.Duration(cfg.DialTimeout) * time.Second,
+		},
 	}
-	received, err := client.Exchange(packet, hostport)
+	clientCtx, cancelFunc := context.WithTimeout(ctx, time.Duration(cfg.ReadTimeout)*time.Second)
+	received, err := client.Exchange(clientCtx, packet, hostport)
+	cancelFunc()
 	if err != nil {
 		return nil, logical.ErrorResponse(err.Error()), nil
 	}
@@ -139,17 +199,15 @@ func (b *backend) RadiusLogin(req *logical.Request, username string, password st
 		return nil, logical.ErrorResponse("access denied by the authentication server"), nil
 	}
 
-	var policies []string
+	policies := cfg.UnregisteredUserPolicies
+
 	// Retrieve user entry from storage
-	user, err := b.user(req.Storage, username)
-	if user == nil {
-		// No user found, check if unregistered users are allowed (unregistered_user_policies not empty)
-		if len(policyutil.SanitizePolicies(cfg.UnregisteredUserPolicies, false)) == 0 {
-			return nil, logical.ErrorResponse("authentication succeeded but user has no associated policies"), nil
-		}
-		policies = policyutil.SanitizePolicies(cfg.UnregisteredUserPolicies, true)
-	} else {
-		policies = policyutil.SanitizePolicies(user.Policies, true)
+	user, err := b.user(ctx, req.Storage, username)
+	if err != nil {
+		return nil, logical.ErrorResponse("could not retrieve user entry from storage"), err
+	}
+	if user != nil {
+		policies = user.Policies
 	}
 
 	return policies, &logical.Response{}, nil

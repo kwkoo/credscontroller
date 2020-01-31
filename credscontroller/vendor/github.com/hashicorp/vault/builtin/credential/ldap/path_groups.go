@@ -1,11 +1,12 @@
 package ldap
 
 import (
+	"context"
 	"strings"
 
-	"github.com/hashicorp/vault/helper/policyutil"
-	"github.com/hashicorp/vault/logical"
-	"github.com/hashicorp/vault/logical/framework"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func pathGroupsList(b *backend) *framework.Path {
@@ -18,6 +19,10 @@ func pathGroupsList(b *backend) *framework.Path {
 
 		HelpSynopsis:    pathGroupHelpSyn,
 		HelpDescription: pathGroupHelpDesc,
+		DisplayAttrs: &framework.DisplayAttributes{
+			Navigation: true,
+			ItemType:   "Group",
+		},
 	}
 }
 
@@ -25,13 +30,13 @@ func pathGroups(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: `groups/(?P<name>.+)`,
 		Fields: map[string]*framework.FieldSchema{
-			"name": &framework.FieldSchema{
+			"name": {
 				Type:        framework.TypeString,
 				Description: "Name of the LDAP group.",
 			},
 
-			"policies": &framework.FieldSchema{
-				Type:        framework.TypeString,
+			"policies": {
+				Type:        framework.TypeCommaStringSlice,
 				Description: "Comma-separated list of policies associated to the group.",
 			},
 		},
@@ -44,11 +49,15 @@ func pathGroups(b *backend) *framework.Path {
 
 		HelpSynopsis:    pathGroupHelpSyn,
 		HelpDescription: pathGroupHelpDesc,
+		DisplayAttrs: &framework.DisplayAttributes{
+			Action:   "Create",
+			ItemType: "Group",
+		},
 	}
 }
 
-func (b *backend) Group(s logical.Storage, n string) (*GroupEntry, error) {
-	entry, err := s.Get("group/" + n)
+func (b *backend) Group(ctx context.Context, s logical.Storage, n string) (*GroupEntry, error) {
+	entry, err := s.Get(ctx, "group/"+n)
 	if err != nil {
 		return nil, err
 	}
@@ -64,9 +73,8 @@ func (b *backend) Group(s logical.Storage, n string) (*GroupEntry, error) {
 	return &result, nil
 }
 
-func (b *backend) pathGroupDelete(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	err := req.Storage.Delete("group/" + d.Get("name").(string))
+func (b *backend) pathGroupDelete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	err := req.Storage.Delete(ctx, "group/"+d.Get("name").(string))
 	if err != nil {
 		return nil, err
 	}
@@ -74,9 +82,21 @@ func (b *backend) pathGroupDelete(
 	return nil, nil
 }
 
-func (b *backend) pathGroupRead(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	group, err := b.Group(req.Storage, d.Get("name").(string))
+func (b *backend) pathGroupRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	groupname := d.Get("name").(string)
+
+	cfg, err := b.Config(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return logical.ErrorResponse("ldap backend not configured"), nil
+	}
+	if !*cfg.CaseSensitiveNames {
+		groupname = strings.ToLower(groupname)
+	}
+
+	group, err := b.Group(ctx, req.Storage, groupname)
 	if err != nil {
 		return nil, err
 	}
@@ -86,34 +106,48 @@ func (b *backend) pathGroupRead(
 
 	return &logical.Response{
 		Data: map[string]interface{}{
-			"policies": strings.Join(group.Policies, ","),
+			"policies": group.Policies,
 		},
 	}, nil
 }
 
-func (b *backend) pathGroupWrite(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *backend) pathGroupWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	groupname := d.Get("name").(string)
+
+	cfg, err := b.Config(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return logical.ErrorResponse("ldap backend not configured"), nil
+	}
+	if !*cfg.CaseSensitiveNames {
+		groupname = strings.ToLower(groupname)
+	}
+
 	// Store it
-	entry, err := logical.StorageEntryJSON("group/"+d.Get("name").(string), &GroupEntry{
-		Policies: policyutil.ParsePolicies(d.Get("policies").(string)),
+	entry, err := logical.StorageEntryJSON("group/"+groupname, &GroupEntry{
+		Policies: policyutil.ParsePolicies(d.Get("policies")),
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := req.Storage.Put(entry); err != nil {
+	if err := req.Storage.Put(ctx, entry); err != nil {
 		return nil, err
 	}
 
 	return nil, nil
 }
 
-func (b *backend) pathGroupList(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	groups, err := req.Storage.List("group/")
+func (b *backend) pathGroupList(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	keys, err := logical.CollectKeysWithPrefix(ctx, req.Storage, "group/")
 	if err != nil {
 		return nil, err
 	}
-	return logical.ListResponse(groups), nil
+	for i := range keys {
+		keys[i] = strings.TrimPrefix(keys[i], "group/")
+	}
+	return logical.ListResponse(keys), nil
 }
 
 type GroupEntry struct {
@@ -121,7 +155,7 @@ type GroupEntry struct {
 }
 
 const pathGroupHelpSyn = `
-Manage users allowed to authenticate.
+Manage additional groups for users allowed to authenticate.
 `
 
 const pathGroupHelpDesc = `

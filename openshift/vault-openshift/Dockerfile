@@ -1,4 +1,4 @@
-FROM docker.io/vault:0.11.1
+FROM docker.io/vault:1.3.2
 
 COPY docker-entrypoint.sh /usr/local/bin/
 

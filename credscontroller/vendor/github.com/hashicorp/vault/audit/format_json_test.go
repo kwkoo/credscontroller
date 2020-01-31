@@ -2,6 +2,7 @@ package audit
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -9,20 +10,42 @@ import (
 
 	"errors"
 
-	"github.com/hashicorp/vault/helper/jsonutil"
-	"github.com/hashicorp/vault/helper/salt"
-	"github.com/hashicorp/vault/logical"
+	"fmt"
+
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/sdk/helper/jsonutil"
+	"github.com/hashicorp/vault/sdk/helper/salt"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func TestFormatJSON_formatRequest(t *testing.T) {
+	salter, err := salt.NewSalt(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saltFunc := func(context.Context) (*salt.Salt, error) {
+		return salter, nil
+	}
+
+	expectedResultStr := fmt.Sprintf(testFormatJSONReqBasicStrFmt, salter.GetIdentifiedHMAC("foo"))
+
 	cases := map[string]struct {
-		Auth   *logical.Auth
-		Req    *logical.Request
-		Err    error
-		Result string
+		Auth        *logical.Auth
+		Req         *logical.Request
+		Err         error
+		Prefix      string
+		ExpectedStr string
 	}{
 		"auth, request": {
-			&logical.Auth{ClientToken: "foo", Policies: []string{"root"}},
+			&logical.Auth{
+				ClientToken:     "foo",
+				Accessor:        "bar",
+				DisplayName:     "testtoken",
+				EntityID:        "foobarentity",
+				NoDefaultPolicy: true,
+				Policies:        []string{"root"},
+				TokenType:       logical.TokenTypeService,
+			},
 			&logical.Request{
 				Operation: logical.UpdateOperation,
 				Path:      "/foo",
@@ -37,30 +60,71 @@ func TestFormatJSON_formatRequest(t *testing.T) {
 				},
 			},
 			errors.New("this is an error"),
-			testFormatJSONReqBasicStr,
+			"",
+			expectedResultStr,
+		},
+		"auth, request with prefix": {
+			&logical.Auth{
+				ClientToken:     "foo",
+				Accessor:        "bar",
+				EntityID:        "foobarentity",
+				DisplayName:     "testtoken",
+				NoDefaultPolicy: true,
+				Policies:        []string{"root"},
+				TokenType:       logical.TokenTypeService,
+			},
+			&logical.Request{
+				Operation: logical.UpdateOperation,
+				Path:      "/foo",
+				Connection: &logical.Connection{
+					RemoteAddr: "127.0.0.1",
+				},
+				WrapInfo: &logical.RequestWrapInfo{
+					TTL: 60 * time.Second,
+				},
+				Headers: map[string][]string{
+					"foo": []string{"bar"},
+				},
+			},
+			errors.New("this is an error"),
+			"@cee: ",
+			expectedResultStr,
 		},
 	}
 
 	for name, tc := range cases {
 		var buf bytes.Buffer
 		formatter := AuditFormatter{
-			AuditFormatWriter: &JSONFormatWriter{},
+			AuditFormatWriter: &JSONFormatWriter{
+				Prefix:   tc.Prefix,
+				SaltFunc: saltFunc,
+			},
 		}
-		salter, _ := salt.NewSalt(nil, nil)
 		config := FormatterConfig{
-			Salt: salter,
+			HMACAccessor: false,
 		}
-		if err := formatter.FormatRequest(&buf, config, tc.Auth, tc.Req, tc.Err); err != nil {
+		in := &logical.LogInput{
+			Auth:     tc.Auth,
+			Request:  tc.Req,
+			OuterErr: tc.Err,
+		}
+		if err := formatter.FormatRequest(namespace.RootContext(nil), &buf, config, in); err != nil {
 			t.Fatalf("bad: %s\nerr: %s", name, err)
 		}
 
-		var expectedjson = new(AuditRequestEntry)
-		if err := jsonutil.DecodeJSON([]byte(tc.Result), &expectedjson); err != nil {
-			t.Fatalf("bad json: %s", err)
+		if !strings.HasPrefix(buf.String(), tc.Prefix) {
+			t.Fatalf("no prefix: %s \n log: %s\nprefix: %s", name, expectedResultStr, tc.Prefix)
 		}
 
+		var expectedjson = new(AuditRequestEntry)
+
+		if err := jsonutil.DecodeJSON([]byte(expectedResultStr), &expectedjson); err != nil {
+			t.Fatalf("bad json: %s", err)
+		}
+		expectedjson.Request.Namespace = &AuditNamespace{ID: "root"}
+
 		var actualjson = new(AuditRequestEntry)
-		if err := jsonutil.DecodeJSON([]byte(buf.String()), &actualjson); err != nil {
+		if err := jsonutil.DecodeJSON([]byte(buf.String())[len(tc.Prefix):], &actualjson); err != nil {
 			t.Fatalf("bad json: %s", err)
 		}
 
@@ -71,7 +135,7 @@ func TestFormatJSON_formatRequest(t *testing.T) {
 			t.Fatalf("unable to marshal json: %s", err)
 		}
 
-		if strings.TrimSpace(buf.String()) != string(expectedBytes) {
+		if !strings.HasSuffix(strings.TrimSpace(buf.String()), string(expectedBytes)) {
 			t.Fatalf(
 				"bad: %s\nResult:\n\n'%s'\n\nExpected:\n\n'%s'",
 				name, buf.String(), string(expectedBytes))
@@ -79,5 +143,5 @@ func TestFormatJSON_formatRequest(t *testing.T) {
 	}
 }
 
-const testFormatJSONReqBasicStr = `{"time":"2015-08-05T13:45:46Z","type":"request","auth":{"display_name":"","policies":["root"],"metadata":null},"request":{"operation":"update","path":"/foo","data":null,"wrap_ttl":60,"remote_address":"127.0.0.1","headers":{"foo":["bar"]}},"error":"this is an error"}
+const testFormatJSONReqBasicStrFmt = `{"time":"2015-08-05T13:45:46Z","type":"request","auth":{"client_token":"%s","accessor":"bar","display_name":"testtoken","policies":["root"],"no_default_policy":true,"metadata":null,"entity_id":"foobarentity","token_type":"service"},"request":{"operation":"update","path":"/foo","data":null,"wrap_ttl":60,"remote_address":"127.0.0.1","headers":{"foo":["bar"]}},"error":"this is an error"}
 `

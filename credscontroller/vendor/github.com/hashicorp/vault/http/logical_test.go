@@ -2,17 +2,28 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
-	log "github.com/mgutz/logxi/v1"
+	"github.com/go-test/deep"
+	log "github.com/hashicorp/go-hclog"
 
-	"github.com/hashicorp/vault/helper/logformat"
-	"github.com/hashicorp/vault/physical"
+	"github.com/hashicorp/vault/audit"
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/sdk/helper/consts"
+	"github.com/hashicorp/vault/sdk/helper/logging"
+	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/hashicorp/vault/sdk/physical"
+	"github.com/hashicorp/vault/sdk/physical/inmem"
 	"github.com/hashicorp/vault/vault"
 )
 
@@ -50,8 +61,8 @@ func TestLogical(t *testing.T) {
 	testResponseBody(t, resp, &actual)
 	delete(actual, "lease_id")
 	expected["request_id"] = actual["request_id"]
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad:\nactual:\n%#v\nexpected:\n%#v", actual, expected)
+	if diff := deep.Equal(actual, expected); diff != nil {
+		t.Fatal(diff)
 	}
 
 	// DELETE
@@ -79,12 +90,15 @@ func TestLogical_StandbyRedirect(t *testing.T) {
 	defer ln2.Close()
 
 	// Create an HA Vault
-	logger := logformat.NewVaultLogger(log.LevelTrace)
+	logger := logging.NewVaultLogger(log.Debug)
 
-	inmha := physical.NewInmemHA(logger)
+	inmha, err := inmem.NewInmemHA(nil, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
 	conf := &vault.CoreConfig{
 		Physical:     inmha,
-		HAPhysical:   inmha,
+		HAPhysical:   inmha.(physical.HABackend),
 		RedirectAddr: addr1,
 		DisableMlock: true,
 	}
@@ -101,12 +115,12 @@ func TestLogical_StandbyRedirect(t *testing.T) {
 
 	// Attempt to fix raciness in this test by giving the first core a chance
 	// to grab the lock
-	time.Sleep(time.Second)
+	time.Sleep(2 * time.Second)
 
 	// Create a second HA Vault
 	conf2 := &vault.CoreConfig{
 		Physical:     inmha,
-		HAPhysical:   inmha,
+		HAPhysical:   inmha.(physical.HABackend),
 		RedirectAddr: addr2,
 		DisableMlock: true,
 	}
@@ -128,9 +142,9 @@ func TestLogical_StandbyRedirect(t *testing.T) {
 	resp := testHttpPutDisableRedirect(t, root, addr2+"/v1/secret/foo", map[string]interface{}{
 		"data": "bar",
 	})
-	logger.Trace("307 test one starting")
+	logger.Debug("307 test one starting")
 	testResponseStatus(t, resp, 307)
-	logger.Trace("307 test one stopping")
+	logger.Debug("307 test one stopping")
 
 	//// READ to standby
 	resp = testHttpGet(t, root, addr2+"/v1/auth/token/lookup-self")
@@ -150,6 +164,9 @@ func TestLogical_StandbyRedirect(t *testing.T) {
 			"ttl":              json.Number("0"),
 			"creation_ttl":     json.Number("0"),
 			"explicit_max_ttl": json.Number("0"),
+			"expire_time":      nil,
+			"entity_id":        "",
+			"type":             "service",
 		},
 		"warnings":  nilWarnings,
 		"wrap_info": nil,
@@ -164,15 +181,15 @@ func TestLogical_StandbyRedirect(t *testing.T) {
 	actual["data"] = actualDataMap
 	expected["request_id"] = actual["request_id"]
 	delete(actual, "lease_id")
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: got %#v; expected %#v", actual, expected)
+	if diff := deep.Equal(actual, expected); diff != nil {
+		t.Fatal(diff)
 	}
 
 	//// DELETE to standby
 	resp = testHttpDeleteDisableRedirect(t, root, addr2+"/v1/secret/foo")
-	logger.Trace("307 test two starting")
+	logger.Debug("307 test two starting")
 	testResponseStatus(t, resp, 307)
-	logger.Trace("307 test two stopping")
+	logger.Debug("307 test two stopping")
 }
 
 func TestLogical_CreateToken(t *testing.T) {
@@ -196,9 +213,13 @@ func TestLogical_CreateToken(t *testing.T) {
 		"wrap_info":      nil,
 		"auth": map[string]interface{}{
 			"policies":       []interface{}{"root"},
+			"token_policies": []interface{}{"root"},
 			"metadata":       nil,
 			"lease_duration": json.Number("0"),
 			"renewable":      false,
+			"entity_id":      "",
+			"token_type":     "service",
+			"orphan":         false,
 		},
 		"warnings": nilWarnings,
 	}
@@ -248,7 +269,171 @@ func TestLogical_RequestSizeLimit(t *testing.T) {
 
 	// Write a very large object, should fail
 	resp := testHttpPut(t, token, addr+"/v1/secret/foo", map[string]interface{}{
-		"data": make([]byte, MaxRequestSize),
+		"data": make([]byte, DefaultMaxRequestSize),
 	})
 	testResponseStatus(t, resp, 413)
+}
+
+func TestLogical_ListSuffix(t *testing.T) {
+	core, _, rootToken := vault.TestCoreUnsealed(t)
+	req, _ := http.NewRequest("GET", "http://127.0.0.1:8200/v1/secret/foo", nil)
+	req = req.WithContext(namespace.RootContext(nil))
+	req.Header.Add(consts.AuthHeaderName, rootToken)
+	lreq, _, status, err := buildLogicalRequest(core, nil, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != 0 {
+		t.Fatalf("got status %d", status)
+	}
+	if strings.HasSuffix(lreq.Path, "/") {
+		t.Fatal("trailing slash found on path")
+	}
+
+	req, _ = http.NewRequest("GET", "http://127.0.0.1:8200/v1/secret/foo?list=true", nil)
+	req = req.WithContext(namespace.RootContext(nil))
+	req.Header.Add(consts.AuthHeaderName, rootToken)
+	lreq, _, status, err = buildLogicalRequest(core, nil, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != 0 {
+		t.Fatalf("got status %d", status)
+	}
+	if !strings.HasSuffix(lreq.Path, "/") {
+		t.Fatal("trailing slash not found on path")
+	}
+
+	req, _ = http.NewRequest("LIST", "http://127.0.0.1:8200/v1/secret/foo", nil)
+	req = req.WithContext(namespace.RootContext(nil))
+	req.Header.Add(consts.AuthHeaderName, rootToken)
+	lreq, _, status, err = buildLogicalRequest(core, nil, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != 0 {
+		t.Fatalf("got status %d", status)
+	}
+	if !strings.HasSuffix(lreq.Path, "/") {
+		t.Fatal("trailing slash not found on path")
+	}
+}
+
+func TestLogical_RespondWithStatusCode(t *testing.T) {
+	resp := &logical.Response{
+		Data: map[string]interface{}{
+			"test-data": "foo",
+		},
+	}
+
+	resp404, err := logical.RespondWithStatusCode(resp, &logical.Request{ID: "id"}, http.StatusNotFound)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	respondLogical(w, nil, nil, resp404, false)
+
+	if w.Code != 404 {
+		t.Fatalf("Bad Status code: %d", w.Code)
+	}
+
+	bodyRaw, err := ioutil.ReadAll(w.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := `{"request_id":"id","lease_id":"","renewable":false,"lease_duration":0,"data":{"test-data":"foo"},"wrap_info":null,"warnings":null,"auth":null}`
+
+	if string(bodyRaw[:]) != strings.Trim(expected, "\n") {
+		t.Fatalf("bad response: %s", string(bodyRaw[:]))
+	}
+}
+
+func TestLogical_Audit_invalidWrappingToken(t *testing.T) {
+	// Create a noop audit backend
+	var noop *vault.NoopAudit
+	c, _, root := vault.TestCoreUnsealedWithConfig(t, &vault.CoreConfig{
+		AuditBackends: map[string]audit.Factory{
+			"noop": func(ctx context.Context, config *audit.BackendConfig) (audit.Backend, error) {
+				noop = &vault.NoopAudit{
+					Config: config,
+				}
+				return noop, nil
+			},
+		},
+	})
+	ln, addr := TestServer(t, c)
+	defer ln.Close()
+
+	// Enable the audit backend
+
+	resp := testHttpPost(t, root, addr+"/v1/sys/audit/noop", map[string]interface{}{
+		"type": "noop",
+	})
+	testResponseStatus(t, resp, 204)
+
+	{
+		// Make a wrapping/unwrap request with an invalid token
+		resp := testHttpPost(t, root, addr+"/v1/sys/wrapping/unwrap", map[string]interface{}{
+			"token": "foo",
+		})
+		testResponseStatus(t, resp, 400)
+		body := map[string][]string{}
+		testResponseBody(t, resp, &body)
+		if body["errors"][0] != "wrapping token is not valid or does not exist" {
+			t.Fatal(body)
+		}
+
+		// Check the audit trail on request and response
+		if len(noop.ReqAuth) != 1 {
+			t.Fatalf("bad: %#v", noop)
+		}
+		auth := noop.ReqAuth[0]
+		if auth.ClientToken != root {
+			t.Fatalf("bad client token: %#v", auth)
+		}
+		if len(noop.Req) != 1 || noop.Req[0].Path != "sys/wrapping/unwrap" {
+			t.Fatalf("bad:\ngot:\n%#v", noop.Req[0])
+		}
+
+		if len(noop.ReqErrs) != 1 {
+			t.Fatalf("bad: %#v", noop.RespErrs)
+		}
+		if noop.ReqErrs[0] != consts.ErrInvalidWrappingToken {
+			t.Fatalf("bad: %#v", noop.ReqErrs)
+		}
+	}
+
+	{
+		resp := testHttpPostWrapped(t, root, addr+"/v1/auth/token/create", nil, 10*time.Second)
+		testResponseStatus(t, resp, 200)
+		body := map[string]interface{}{}
+		testResponseBody(t, resp, &body)
+
+		wrapToken := body["wrap_info"].(map[string]interface{})["token"].(string)
+
+		// Make a wrapping/unwrap request with an invalid token
+		resp = testHttpPost(t, root, addr+"/v1/sys/wrapping/unwrap", map[string]interface{}{
+			"token": wrapToken,
+		})
+		testResponseStatus(t, resp, 200)
+
+		// Check the audit trail on request and response
+		if len(noop.ReqAuth) != 3 {
+			t.Fatalf("bad: %#v", noop)
+		}
+		auth := noop.ReqAuth[2]
+		if auth.ClientToken != root {
+			t.Fatalf("bad client token: %#v", auth)
+		}
+		if len(noop.Req) != 3 || noop.Req[2].Path != "sys/wrapping/unwrap" {
+			t.Fatalf("bad:\ngot:\n%#v", noop.Req[2])
+		}
+
+		// Make sure there is only one error in the logs
+		if noop.ReqErrs[1] != nil || noop.ReqErrs[2] != nil {
+			t.Fatalf("bad: %#v", noop.RespErrs)
+		}
+	}
 }

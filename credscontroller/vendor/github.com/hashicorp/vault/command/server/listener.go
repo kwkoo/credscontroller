@@ -1,141 +1,68 @@
 package server
 
 import (
+	"github.com/hashicorp/errwrap"
 	// We must import sha512 so that it registers with the runtime so that
 	// certificates that use it can be parsed.
 	_ "crypto/sha512"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
-	"strconv"
-	"sync"
 
-	"github.com/hashicorp/vault/helper/tlsutil"
-	"github.com/hashicorp/vault/vault"
+	"github.com/hashicorp/vault/helper/proxyutil"
+	"github.com/hashicorp/vault/helper/reload"
+	"github.com/mitchellh/cli"
 )
 
 // ListenerFactory is the factory function to create a listener.
-type ListenerFactory func(map[string]string, io.Writer) (net.Listener, map[string]string, vault.ReloadFunc, error)
+type ListenerFactory func(map[string]interface{}, io.Writer, cli.Ui) (net.Listener, map[string]string, reload.ReloadFunc, error)
 
 // BuiltinListeners is the list of built-in listener types.
 var BuiltinListeners = map[string]ListenerFactory{
-	"tcp":   tcpListenerFactory,
-	"atlas": atlasListenerFactory,
+	"tcp": tcpListenerFactory,
 }
 
 // NewListener creates a new listener of the given type with the given
 // configuration. The type is looked up in the BuiltinListeners map.
-func NewListener(t string, config map[string]string, logger io.Writer) (net.Listener, map[string]string, vault.ReloadFunc, error) {
+func NewListener(t string, config map[string]interface{}, logger io.Writer, ui cli.Ui) (net.Listener, map[string]string, reload.ReloadFunc, error) {
 	f, ok := BuiltinListeners[t]
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("unknown listener type: %s", t)
+		return nil, nil, nil, fmt.Errorf("unknown listener type: %q", t)
 	}
 
-	return f(config, logger)
+	return f(config, logger, ui)
 }
 
-func listenerWrapTLS(
-	ln net.Listener,
-	props map[string]string,
-	config map[string]string) (net.Listener, map[string]string, vault.ReloadFunc, error) {
-	props["tls"] = "disabled"
-
-	if v, ok := config["tls_disable"]; ok {
-		disabled, err := strconv.ParseBool(v)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid value for 'tls_disable': %v", err)
-		}
-		if disabled {
-			return ln, props, nil, nil
-		}
-	}
-
-	_, ok := config["tls_cert_file"]
+func listenerWrapProxy(ln net.Listener, config map[string]interface{}) (net.Listener, error) {
+	behaviorRaw, ok := config["proxy_protocol_behavior"]
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("'tls_cert_file' must be set")
+		return ln, nil
 	}
 
-	_, ok = config["tls_key_file"]
+	behavior, ok := behaviorRaw.(string)
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("'tls_key_file' must be set")
+		return nil, fmt.Errorf("failed parsing proxy_protocol_behavior value: not a string")
 	}
 
-	cg := &certificateGetter{
-		id: config["address"],
+	proxyProtoConfig := &proxyutil.ProxyProtoConfig{
+		Behavior: behavior,
 	}
 
-	if err := cg.reload(config); err != nil {
-		return nil, nil, nil, fmt.Errorf("error loading TLS cert: %s", err)
-	}
-
-	tlsvers, ok := config["tls_min_version"]
-	if !ok {
-		tlsvers = "tls12"
-	}
-
-	tlsConf := &tls.Config{}
-	tlsConf.GetCertificate = cg.getCertificate
-	tlsConf.NextProtos = []string{"h2", "http/1.1"}
-	tlsConf.MinVersion, ok = tlsutil.TLSLookup[tlsvers]
-	if !ok {
-		return nil, nil, nil, fmt.Errorf("'tls_min_version' value %s not supported, please specify one of [tls10,tls11,tls12]", tlsvers)
-	}
-	tlsConf.ClientAuth = tls.RequestClientCert
-
-	if v, ok := config["tls_cipher_suites"]; ok {
-		ciphers, err := tlsutil.ParseCiphers(v)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid value for 'tls_cipher_suites': %v", err)
+	if proxyProtoConfig.Behavior == "allow_authorized" || proxyProtoConfig.Behavior == "deny_unauthorized" {
+		authorizedAddrsRaw, ok := config["proxy_protocol_authorized_addrs"]
+		if !ok {
+			return nil, fmt.Errorf("proxy_protocol_behavior set but no proxy_protocol_authorized_addrs value")
 		}
-		tlsConf.CipherSuites = ciphers
-	}
-	if v, ok := config["tls_prefer_server_cipher_suites"]; ok {
-		preferServer, err := strconv.ParseBool(v)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid value for 'tls_prefer_server_cipher_suites': %v", err)
+
+		if err := proxyProtoConfig.SetAuthorizedAddrs(authorizedAddrsRaw); err != nil {
+			return nil, errwrap.Wrapf("failed parsing proxy_protocol_authorized_addrs: {{err}}", err)
 		}
-		tlsConf.PreferServerCipherSuites = preferServer
 	}
 
-	ln = tls.NewListener(ln, tlsConf)
-	props["tls"] = "enabled"
-	return ln, props, cg.reload, nil
-}
-
-type certificateGetter struct {
-	sync.RWMutex
-
-	cert *tls.Certificate
-
-	id string
-}
-
-func (cg *certificateGetter) reload(config map[string]string) error {
-	if config["address"] != cg.id {
-		return nil
-	}
-
-	cert, err := tls.LoadX509KeyPair(config["tls_cert_file"], config["tls_key_file"])
+	newLn, err := proxyutil.WrapInProxyProto(ln, proxyProtoConfig)
 	if err != nil {
-		return err
+		return nil, errwrap.Wrapf("failed configuring PROXY protocol wrapper: {{err}}", err)
 	}
 
-	cg.Lock()
-	defer cg.Unlock()
-
-	cg.cert = &cert
-
-	return nil
-}
-
-func (cg *certificateGetter) getCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	cg.RLock()
-	defer cg.RUnlock()
-
-	if cg.cert == nil {
-		return nil, fmt.Errorf("nil certificate")
-	}
-
-	return cg.cert, nil
+	return newLn, nil
 }

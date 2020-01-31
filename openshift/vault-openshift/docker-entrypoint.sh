@@ -6,6 +6,9 @@ set -e
 # wouldn't do either of these functions so we'd leak zombies as well as do
 # unclean termination of all our sub-processes.
 
+# Prevent core dumps
+ulimit -c 0
+
 # Allow setting VAULT_REDIRECT_ADDR and VAULT_CLUSTER_ADDR using an interface
 # name instead of an IP address. The interface name is specified using
 # VAULT_REDIRECT_INTERFACE and VAULT_CLUSTER_INTERFACE environment variables. If
@@ -65,19 +68,21 @@ fi
 
 # If we are running Vault, make sure it executes as the proper user.
 #if [ "$1" = 'vault' ]; then
-#    # If the config dir is bind mounted then chown it
-#    if [ "$(stat -c %u /vault/config)" != "$(id -u vault)" ]; then
-#        chown -R vault:vault /vault/config || echo "Could not chown /vault/config (may not have appropriate permissions)"
-#    fi
+#    if [ -z "$SKIP_CHOWN" ]; then
+#        # If the config dir is bind mounted then chown it
+#        if [ "$(stat -c %u /vault/config)" != "$(id -u vault)" ]; then
+#            chown -R vault:vault /vault/config || echo "Could not chown /vault/config (may not have appropriate permissions)"
+#        fi
 #
-#    # If the logs dir is bind mounted then chown it
-#    if [ "$(stat -c %u /vault/logs)" != "$(id -u vault)" ]; then
-#        chown -R vault:vault /vault/logs
-#    fi
+#        # If the logs dir is bind mounted then chown it
+#        if [ "$(stat -c %u /vault/logs)" != "$(id -u vault)" ]; then
+#            chown -R vault:vault /vault/logs
+#        fi
 #
-#    # If the file dir is bind mounted then chown it
-#    if [ "$(stat -c %u /vault/file)" != "$(id -u vault)" ]; then
-#        chown -R vault:vault /vault/file
+#        # If the file dir is bind mounted then chown it
+#        if [ "$(stat -c %u /vault/file)" != "$(id -u vault)" ]; then
+#            chown -R vault:vault /vault/file
+#        fi
 #    fi
 #
 #    if [ -z "$SKIP_SETCAP" ]; then

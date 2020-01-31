@@ -1,16 +1,24 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
+	"os/user"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"strings"
+
 	"github.com/hashicorp/vault/api"
-	"github.com/hashicorp/vault/logical"
-	logicaltest "github.com/hashicorp/vault/logical/testing"
+	logicaltest "github.com/hashicorp/vault/helper/testhelpers/logical"
+	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/vault"
 	"github.com/mitchellh/mapstructure"
 )
@@ -27,6 +35,7 @@ const (
 	testOTPKeyType       = "otp"
 	testDynamicKeyType   = "dynamic"
 	testCIDRList         = "127.0.0.1/32"
+	testAtRoleName       = "test@RoleName"
 	testDynamicRoleName  = "testDynamicRoleName"
 	testOTPRoleName      = "testOTPRoleName"
 	testKeyName          = "testKeyName"
@@ -59,6 +68,42 @@ oOyBJU/HMVvBfv4g+OVFLVgSwwm6owwsouZ0+D/LasbuHqYyqYqdyPJQYzWA2Y+F
 +B6f4RoPdSXj24JHPg/ioRxjaj094UXJxua2yfkcecGNEuBQHSs=
 -----END RSA PRIVATE KEY-----
 `
+	// Public half of `privateKey`, identical to how it would be fed in from a file
+	publicKey = `ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDArgK0ilRRfk8E7HIsjz5l3BuxmwpDd8DHRCVfOhbZ4gOSVxjEOOqBwWGjygdboBIZwFXmwDlU6sWX0hBJAgpQz0Cjvbjxtq/NjkvATrYPgnrXUhTaEn2eQO0PsqRNSFH46SK/oJfTp0q8/WgojxWJ2L7FUV8PO8uIk49DzqAqPV7WXU63vFsjx+3WQOX/ILeQvHCvaqs3dWjjzEoDudRWCOdUqcHEOshV9azIzPrXlQVzRV3QAKl6u7pC+/Secorpwt6IHpMKoVPGiR0tMMuNOVH8zrAKzIxPGfy2WmNDpJopbXMTvSOGAqNcp49O4SKOQl9Fzfq2HEevJamKLrMB dummy@example.com
+`
+	publicKey2 = `AAAAB3NzaC1yc2EAAAADAQABAAABAQDArgK0ilRRfk8E7HIsjz5l3BuxmwpDd8DHRCVfOhbZ4gOSVxjEOOqBwWGjygdboBIZwFXmwDlU6sWX0hBJAgpQz0Cjvbjxtq/NjkvATrYPgnrXUhTaEn2eQO0PsqRNSFH46SK/oJfTp0q8/WgojxWJ2L7FUV8PO8uIk49DzqAqPV7WXU63vFsjx+3WQOX/ILeQvHCvaqs3dWjjzEoDudRWCOdUqcHEOshV9azIzPrXlQVzRV3QAKl6u7pC+/Secorpwt6IHpMKoVPGiR0tMMuNOVH8zrAKzIxPGfy2WmNDpJopbXMTvSOGAqNcp49O4SKOQl9Fzfq2HEevJamKLrMB
+`
+
+	publicKey4096 = `ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC54Oj4YCFDYxYv69Q9KfU6rWYtUB1eByQdUW0nXFi/vr98QUIV77sEeUVhaQzZcuCojAi/GrloW7ta0Z2DaEv5jOQMAnGpXBcqLJsz3KdrHbpvl93MPNdmNaGPU0GnUEsjBVuDVn9HdIUa8CNrxShvPu7/VqoaRHKLqphGgzFb37vi4qvnQ+5VYAO/TzyVYMD6qJX6I/9Pw8d74jCfEdOh2yGKkP7rXWOghreyIl8H2zTJKg9KoZuPq9F5M8nNt7Oi3rf+DwQiYvamzIqlDP4s5oFVTZW0E9lwWvYDpyiJnUrkQqksebBK/rcyfiFG3onb4qLo2WVWXeK3si8IhGik/TEzprScyAWIf9RviT8O+l5hTA2/c+ctn3MVCLRNfez2lKpdxCoprv1MbIcySGWblTJEcY6RA+aauVJpu7FMtRxHHtZKtMpep8cLu8GKbiP6Ifq2JXBtXtNxDeIgo2MkNoMh/NHAsACJniE/dqV/+u9HvhvgrTbJ69ell0nE4ivzA7O4kZgbR/4MHlLgLFvaqC8RrWRLY6BdFagPIMxghWha7Qw16zqoIjRnolvRzUWvSXanJVg8Z6ua1VxwgirNaAH1ivmJhUh2+4lNxCX6jmZyR3zjJsWY03gjJTairvI762opjjalF8fH6Xrs15mB14JiAlNbk6+5REQcvXlGqw== dummy@example.com`
+
+	privateKey = `-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAwK4CtIpUUX5PBOxyLI8+ZdwbsZsKQ3fAx0QlXzoW2eIDklcY
+xDjqgcFho8oHW6ASGcBV5sA5VOrFl9IQSQIKUM9Ao7248bavzY5LwE62D4J611IU
+2hJ9nkDtD7KkTUhR+Okiv6CX06dKvP1oKI8Vidi+xVFfDzvLiJOPQ86gKj1e1l1O
+t7xbI8ft1kDl/yC3kLxwr2qrN3Vo48xKA7nUVgjnVKnBxDrIVfWsyMz615UFc0Vd
+0ACperu6Qvv0nnKK6cLeiB6TCqFTxokdLTDLjTlR/M6wCsyMTxn8tlpjQ6SaKW1z
+E70jhgKjXKePTuEijkJfRc36thxHryWpii6zAQIDAQABAoIBAA/DrPD8iF2KigiL
+F+RRa/eFhLaJStOuTpV/G9eotwnolgY5Hguf5H/tRIHUG7oBZLm6pMyWWZp7AuOj
+CjYO9q0Z5939vc349nVI+SWoyviF4msPiik1bhWulja8lPjFu/8zg+ZNy15Dx7ei
+vAzleAupMiKOv8pNSB/KguQ3WZ9a9bcQcoFQ2Foru6mXpLJ03kghVRlkqvQ7t5cA
+n11d2Hiipq9mleESr0c+MUPKLBX/neaWfGA4xgJTjIYjZi6avmYc/Ox3sQ9aLq2J
+tH0D4HVUZvaU28hn+jhbs64rRFbu++qQMe3vNvi/Q/iqcYU4b6tgDNzm/JFRTS/W
+njiz4mkCgYEA44CnQVmonN6qQ0AgNNlBY5+RX3wwBJZ1AaxpzwDRylAt2vlVUA0n
+YY4RW4J4+RMRKwHwjxK5RRmHjsIJx+nrpqihW3fte3ev5F2A9Wha4dzzEHxBY6IL
+362T/x2f+vYk6tV+uTZSUPHsuELH26mitbBVFNB/00nbMNdEc2bO5FMCgYEA2NCw
+ubt+g2bRkkT/Qf8gIM8ZDpZbARt6onqxVcWkQFT16ZjbsBWUrH1Xi7alv9+lwYLJ
+ckY/XDX4KeU19HabeAbpyy6G9Q2uBSWZlJbjl7QNhdLeuzV82U1/r8fy6Uu3gQnU
+WSFx2GesRpSmZpqNKMs5ksqteZ9Yjg1EIgXdINsCgYBIn9REt1NtKGOf7kOZu1T1
+cYXdvm4xuLoHW7u3OiK+e9P3mCqU0G4m5UxDMyZdFKohWZAqjCaamWi9uNGYgOMa
+I7DG20TzaiS7OOIm9TY17eul8pSJMrypnealxRZB7fug/6Bhjaa/cktIEwFr7P4l
+E/JFH73+fBA9yipu0H3xQwKBgHmiwrLAZF6VrVcxDD9bQQwHA5iyc4Wwg+Fpkdl7
+0wUgZQHTdtRXlxwaCaZhJqX5c4WXuSo6DMvPn1TpuZZXgCsbPch2ZtJOBWXvzTSW
+XkK6iaedQMWoYU2L8+mK9FU73EwxVodWgwcUSosiVCRV6oGLWdZnjGEiK00uVh38
+Si1nAoGBAL47wWinv1cDTnh5mm0mybz3oI2a6V9aIYCloQ/EFcvtahyR/gyB8qNF
+lObH9Faf0WGdnACZvTz22U9gWhw79S0SpDV31tC5Kl8dXHFiZ09vYUKkYmSd/kms
+SeKWrUkryx46LVf6NMhkyYmRqCEjBwfOozzezi5WbiJy6nn54GQt
+-----END RSA PRIVATE KEY-----
+`
 )
 
 func TestBackend_allowed_users(t *testing.T) {
@@ -69,7 +114,7 @@ func TestBackend_allowed_users(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = b.Setup(config)
+	err = b.Setup(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +133,7 @@ func TestBackend_allowed_users(t *testing.T) {
 		Data:      roleData,
 	}
 
-	resp, err := b.HandleRequest(roleReq)
+	resp, err := b.HandleRequest(context.Background(), roleReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp != nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -104,7 +149,7 @@ func TestBackend_allowed_users(t *testing.T) {
 		Data:      credsData,
 	}
 
-	resp, err = b.HandleRequest(credsReq)
+	resp, err = b.HandleRequest(context.Background(), credsReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp == nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -116,7 +161,7 @@ func TestBackend_allowed_users(t *testing.T) {
 	}
 
 	credsData["username"] = "test"
-	resp, err = b.HandleRequest(credsReq)
+	resp, err = b.HandleRequest(context.Background(), credsReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp == nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -128,19 +173,19 @@ func TestBackend_allowed_users(t *testing.T) {
 	}
 
 	credsData["username"] = "random"
-	resp, err = b.HandleRequest(credsReq)
+	resp, err = b.HandleRequest(context.Background(), credsReq)
 	if err != nil || resp == nil || (resp != nil && !resp.IsError()) {
 		t.Fatalf("expected failure: resp:%#v err:%s", resp, err)
 	}
 
 	delete(roleData, "allowed_users")
-	resp, err = b.HandleRequest(roleReq)
+	resp, err = b.HandleRequest(context.Background(), roleReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp != nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
 
 	credsData["username"] = "ubuntu"
-	resp, err = b.HandleRequest(credsReq)
+	resp, err = b.HandleRequest(context.Background(), credsReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp == nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -152,18 +197,18 @@ func TestBackend_allowed_users(t *testing.T) {
 	}
 
 	credsData["username"] = "test"
-	resp, err = b.HandleRequest(credsReq)
+	resp, err = b.HandleRequest(context.Background(), credsReq)
 	if err != nil || resp == nil || (resp != nil && !resp.IsError()) {
 		t.Fatalf("expected failure: resp:%#v err:%s", resp, err)
 	}
 
 	roleData["allowed_users"] = "*"
-	resp, err = b.HandleRequest(roleReq)
+	resp, err = b.HandleRequest(context.Background(), roleReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp != nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
 
-	resp, err = b.HandleRequest(credsReq)
+	resp, err = b.HandleRequest(context.Background(), credsReq)
 	if err != nil || (resp != nil && resp.IsError()) || resp == nil {
 		t.Fatalf("failed to create role: resp:%#v err:%s", resp, err)
 	}
@@ -175,14 +220,14 @@ func TestBackend_allowed_users(t *testing.T) {
 	}
 }
 
-func testingFactory(conf *logical.BackendConfig) (logical.Backend, error) {
+func testingFactory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
 	_, err := vault.StartSSHHostTestServer()
 	if err != nil {
 		panic(fmt.Sprintf("error starting mock server:%s", err))
 	}
 	defaultLeaseTTLVal := 2 * time.Minute
 	maxLeaseTTLVal := 10 * time.Minute
-	return Factory(&logical.BackendConfig{
+	return Factory(context.Background(), &logical.BackendConfig{
 		Logger:      nil,
 		StorageView: &logical.InmemStorage{},
 		System: &logical.StaticSystemView{
@@ -212,9 +257,10 @@ func TestSSHBackend_Lookup(t *testing.T) {
 	resp2 := []string{testOTPRoleName}
 	resp3 := []string{testDynamicRoleName, testOTPRoleName}
 	resp4 := []string{testDynamicRoleName}
+	resp5 := []string{testAtRoleName}
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testLookupRead(t, data, resp1),
 			testRoleWrite(t, testOTPRoleName, testOTPRoleData),
@@ -226,6 +272,52 @@ func TestSSHBackend_Lookup(t *testing.T) {
 			testLookupRead(t, data, resp4),
 			testRoleDelete(t, testDynamicRoleName),
 			testLookupRead(t, data, resp1),
+			testRoleWrite(t, testAtRoleName, testDynamicRoleData),
+			testLookupRead(t, data, resp5),
+			testRoleDelete(t, testAtRoleName),
+			testLookupRead(t, data, resp1),
+		},
+	})
+}
+
+func TestSSHBackend_RoleList(t *testing.T) {
+	testOTPRoleData := map[string]interface{}{
+		"key_type":     testOTPKeyType,
+		"default_user": testUserName,
+		"cidr_list":    testCIDRList,
+	}
+	resp1 := map[string]interface{}{}
+	resp2 := map[string]interface{}{
+		"keys": []string{testOTPRoleName},
+		"key_info": map[string]interface{}{
+			testOTPRoleName: map[string]interface{}{
+				"key_type": testOTPKeyType,
+			},
+		},
+	}
+	resp3 := map[string]interface{}{
+		"keys": []string{testAtRoleName, testOTPRoleName},
+		"key_info": map[string]interface{}{
+			testOTPRoleName: map[string]interface{}{
+				"key_type": testOTPKeyType,
+			},
+			testAtRoleName: map[string]interface{}{
+				"key_type": testOTPKeyType,
+			},
+		},
+	}
+	logicaltest.Test(t, logicaltest.TestCase{
+		LogicalFactory: testingFactory,
+		Steps: []logicaltest.TestStep{
+			testRoleList(t, resp1),
+			testRoleWrite(t, testOTPRoleName, testOTPRoleData),
+			testRoleList(t, resp2),
+			testRoleWrite(t, testAtRoleName, testOTPRoleData),
+			testRoleList(t, resp3),
+			testRoleDelete(t, testAtRoleName),
+			testRoleList(t, resp2),
+			testRoleDelete(t, testOTPRoleName),
+			testRoleList(t, resp1),
 		},
 	})
 }
@@ -243,12 +335,15 @@ func TestSSHBackend_DynamicKeyCreate(t *testing.T) {
 		"ip":       testIP,
 	}
 	logicaltest.Test(t, logicaltest.TestCase{
+		PreCheck:       testAccUserPrecheckFunc(t),
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testNamedKeysWrite(t, testKeyName, testSharedPrivateKey),
 			testRoleWrite(t, testDynamicRoleName, testDynamicRoleData),
 			testCredsWrite(t, testDynamicRoleName, data, false),
+			testRoleWrite(t, testAtRoleName, testDynamicRoleData),
+			testCredsWrite(t, testAtRoleName, data, false),
 		},
 	})
 }
@@ -267,12 +362,16 @@ func TestSSHBackend_OTPRoleCrud(t *testing.T) {
 	}
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testRoleWrite(t, testOTPRoleName, testOTPRoleData),
 			testRoleRead(t, testOTPRoleName, respOTPRoleData),
 			testRoleDelete(t, testOTPRoleName),
 			testRoleRead(t, testOTPRoleName, nil),
+			testRoleWrite(t, testAtRoleName, testOTPRoleData),
+			testRoleRead(t, testAtRoleName, respOTPRoleData),
+			testRoleDelete(t, testAtRoleName),
+			testRoleRead(t, testAtRoleName, nil),
 		},
 	})
 }
@@ -297,13 +396,17 @@ func TestSSHBackend_DynamicRoleCrud(t *testing.T) {
 	}
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testNamedKeysWrite(t, testKeyName, testSharedPrivateKey),
 			testRoleWrite(t, testDynamicRoleName, testDynamicRoleData),
 			testRoleRead(t, testDynamicRoleName, respDynamicRoleData),
 			testRoleDelete(t, testDynamicRoleName),
 			testRoleRead(t, testDynamicRoleName, nil),
+			testRoleWrite(t, testAtRoleName, testDynamicRoleData),
+			testRoleRead(t, testAtRoleName, respDynamicRoleData),
+			testRoleDelete(t, testAtRoleName),
+			testRoleRead(t, testAtRoleName, nil),
 		},
 	})
 }
@@ -311,7 +414,7 @@ func TestSSHBackend_DynamicRoleCrud(t *testing.T) {
 func TestSSHBackend_NamedKeysCrud(t *testing.T) {
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testNamedKeysWrite(t, testKeyName, testSharedPrivateKey),
 			testNamedKeysDelete(t),
@@ -331,10 +434,12 @@ func TestSSHBackend_OTPCreate(t *testing.T) {
 	}
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testRoleWrite(t, testOTPRoleName, testOTPRoleData),
 			testCredsWrite(t, testOTPRoleName, data, false),
+			testRoleWrite(t, testAtRoleName, testOTPRoleData),
+			testCredsWrite(t, testAtRoleName, data, false),
 		},
 	})
 }
@@ -348,7 +453,7 @@ func TestSSHBackend_VerifyEcho(t *testing.T) {
 	}
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testVerifyWrite(t, verifyData, expectedData),
 		},
@@ -386,7 +491,7 @@ func TestSSHBackend_ConfigZeroAddressCRUD(t *testing.T) {
 
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testRoleWrite(t, testOTPRoleName, testOTPRoleData),
 			testConfigZeroAddressWrite(t, req1),
@@ -404,13 +509,7 @@ func TestSSHBackend_ConfigZeroAddressCRUD(t *testing.T) {
 	})
 }
 
-func TestSSHBackend_CredsForZeroAddressRoles(t *testing.T) {
-	dynamicRoleData := map[string]interface{}{
-		"key_type":     testDynamicKeyType,
-		"key":          testKeyName,
-		"admin_user":   testAdminUser,
-		"default_user": testAdminUser,
-	}
+func TestSSHBackend_CredsForZeroAddressRoles_otp(t *testing.T) {
 	otpRoleData := map[string]interface{}{
 		"key_type":     testOTPKeyType,
 		"default_user": testUserName,
@@ -422,27 +521,488 @@ func TestSSHBackend_CredsForZeroAddressRoles(t *testing.T) {
 	req1 := map[string]interface{}{
 		"roles": testOTPRoleName,
 	}
-	req2 := map[string]interface{}{
-		"roles": fmt.Sprintf("%s,%s", testOTPRoleName, testDynamicRoleName),
-	}
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		Factory:        testingFactory,
+		LogicalFactory: testingFactory,
 		Steps: []logicaltest.TestStep{
 			testRoleWrite(t, testOTPRoleName, otpRoleData),
 			testCredsWrite(t, testOTPRoleName, data, true),
 			testConfigZeroAddressWrite(t, req1),
 			testCredsWrite(t, testOTPRoleName, data, false),
+			testConfigZeroAddressDelete(t),
+			testCredsWrite(t, testOTPRoleName, data, true),
+		},
+	})
+}
+
+func TestSSHBackend_CredsForZeroAddressRoles_dynamic(t *testing.T) {
+	dynamicRoleData := map[string]interface{}{
+		"key_type":     testDynamicKeyType,
+		"key":          testKeyName,
+		"admin_user":   testAdminUser,
+		"default_user": testAdminUser,
+	}
+	data := map[string]interface{}{
+		"username": testUserName,
+		"ip":       testIP,
+	}
+	req2 := map[string]interface{}{
+		"roles": testDynamicRoleName,
+	}
+	logicaltest.Test(t, logicaltest.TestCase{
+		PreCheck:       testAccUserPrecheckFunc(t),
+		AcceptanceTest: true,
+		LogicalFactory: testingFactory,
+		Steps: []logicaltest.TestStep{
 			testNamedKeysWrite(t, testKeyName, testSharedPrivateKey),
 			testRoleWrite(t, testDynamicRoleName, dynamicRoleData),
 			testCredsWrite(t, testDynamicRoleName, data, true),
 			testConfigZeroAddressWrite(t, req2),
 			testCredsWrite(t, testDynamicRoleName, data, false),
 			testConfigZeroAddressDelete(t),
-			testCredsWrite(t, testOTPRoleName, data, true),
 			testCredsWrite(t, testDynamicRoleName, data, true),
 		},
 	})
+}
+
+func TestBackend_AbleToRetrievePublicKey(t *testing.T) {
+
+	config := logical.TestBackendConfig()
+
+	b, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Cannot create backend: %s", err)
+	}
+
+	testCase := logicaltest.TestCase{
+		LogicalBackend: b,
+		Steps: []logicaltest.TestStep{
+			configCaStep(),
+
+			logicaltest.TestStep{
+				Operation:       logical.ReadOperation,
+				Path:            "public_key",
+				Unauthenticated: true,
+
+				Check: func(resp *logical.Response) error {
+
+					key := string(resp.Data["http_raw_body"].([]byte))
+
+					if key != publicKey {
+						return fmt.Errorf("public_key incorrect. Expected %v, actual %v", publicKey, key)
+					}
+
+					return nil
+				},
+			},
+		},
+	}
+
+	logicaltest.Test(t, testCase)
+}
+
+func TestBackend_AbleToAutoGenerateSigningKeys(t *testing.T) {
+
+	config := logical.TestBackendConfig()
+
+	b, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Cannot create backend: %s", err)
+	}
+
+	testCase := logicaltest.TestCase{
+		LogicalBackend: b,
+		Steps: []logicaltest.TestStep{
+			logicaltest.TestStep{
+				Operation: logical.UpdateOperation,
+				Path:      "config/ca",
+			},
+
+			logicaltest.TestStep{
+				Operation:       logical.ReadOperation,
+				Path:            "public_key",
+				Unauthenticated: true,
+
+				Check: func(resp *logical.Response) error {
+
+					key := string(resp.Data["http_raw_body"].([]byte))
+
+					if key == "" {
+						return fmt.Errorf("public_key empty. Expected not empty, actual %s", key)
+					}
+
+					return nil
+				},
+			},
+		},
+	}
+
+	logicaltest.Test(t, testCase)
+}
+
+func TestBackend_ValidPrincipalsValidatedForHostCertificates(t *testing.T) {
+	config := logical.TestBackendConfig()
+
+	b, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Cannot create backend: %s", err)
+	}
+
+	testCase := logicaltest.TestCase{
+		LogicalBackend: b,
+		Steps: []logicaltest.TestStep{
+			configCaStep(),
+
+			createRoleStep("testing", map[string]interface{}{
+				"key_type":                "ca",
+				"allow_host_certificates": true,
+				"allowed_domains":         "example.com,example.org",
+				"allow_subdomains":        true,
+				"default_critical_options": map[string]interface{}{
+					"option": "value",
+				},
+				"default_extensions": map[string]interface{}{
+					"extension": "extended",
+				},
+			}),
+
+			signCertificateStep("testing", "vault-root-22608f5ef173aabf700797cb95c5641e792698ec6380e8e1eb55523e39aa5e51", ssh.HostCert, []string{"dummy.example.org", "second.example.com"}, map[string]string{
+				"option": "value",
+			}, map[string]string{
+				"extension": "extended",
+			},
+				2*time.Hour, map[string]interface{}{
+					"public_key":       publicKey2,
+					"ttl":              "2h",
+					"cert_type":        "host",
+					"valid_principals": "dummy.example.org,second.example.com",
+				}),
+		},
+	}
+
+	logicaltest.Test(t, testCase)
+}
+
+func TestBackend_OptionsOverrideDefaults(t *testing.T) {
+	config := logical.TestBackendConfig()
+
+	b, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Cannot create backend: %s", err)
+	}
+
+	testCase := logicaltest.TestCase{
+		LogicalBackend: b,
+		Steps: []logicaltest.TestStep{
+			configCaStep(),
+
+			createRoleStep("testing", map[string]interface{}{
+				"key_type":                 "ca",
+				"allowed_users":            "tuber",
+				"default_user":             "tuber",
+				"allow_user_certificates":  true,
+				"allowed_critical_options": "option,secondary",
+				"allowed_extensions":       "extension,additional",
+				"default_critical_options": map[string]interface{}{
+					"option": "value",
+				},
+				"default_extensions": map[string]interface{}{
+					"extension": "extended",
+				},
+			}),
+
+			signCertificateStep("testing", "vault-root-22608f5ef173aabf700797cb95c5641e792698ec6380e8e1eb55523e39aa5e51", ssh.UserCert, []string{"tuber"}, map[string]string{
+				"secondary": "value",
+			}, map[string]string{
+				"additional": "value",
+			}, 2*time.Hour, map[string]interface{}{
+				"public_key": publicKey2,
+				"ttl":        "2h",
+				"critical_options": map[string]interface{}{
+					"secondary": "value",
+				},
+				"extensions": map[string]interface{}{
+					"additional": "value",
+				},
+			}),
+		},
+	}
+
+	logicaltest.Test(t, testCase)
+}
+
+func TestBackend_AllowedUserKeyLengths(t *testing.T) {
+	config := logical.TestBackendConfig()
+
+	b, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Cannot create backend: %s", err)
+	}
+	testCase := logicaltest.TestCase{
+		LogicalBackend: b,
+		Steps: []logicaltest.TestStep{
+			configCaStep(),
+			createRoleStep("weakkey", map[string]interface{}{
+				"key_type":                "ca",
+				"allow_user_certificates": true,
+				"allowed_user_key_lengths": map[string]interface{}{
+					"rsa": json.Number(strconv.FormatInt(4096, 10)),
+				},
+			}),
+			logicaltest.TestStep{
+				Operation: logical.UpdateOperation,
+				Path:      "sign/weakkey",
+				Data: map[string]interface{}{
+					"public_key": publicKey,
+				},
+				ErrorOk: true,
+				Check: func(resp *logical.Response) error {
+					if resp.Data["error"] != "public_key failed to meet the key requirements: key is of an invalid size: 2048" {
+						return errors.New("a smaller key (2048) was allowed, when the minimum was set for 4096")
+					}
+					return nil
+				},
+			},
+			createRoleStep("stdkey", map[string]interface{}{
+				"key_type":                "ca",
+				"allow_user_certificates": true,
+				"allowed_user_key_lengths": map[string]interface{}{
+					"rsa": json.Number(strconv.FormatInt(2048, 10)),
+				},
+			}),
+			// Pass with 2048 key
+			logicaltest.TestStep{
+				Operation: logical.UpdateOperation,
+				Path:      "sign/stdkey",
+				Data: map[string]interface{}{
+					"public_key": publicKey,
+				},
+			},
+			// Fail with 4096 key
+			logicaltest.TestStep{
+				Operation: logical.UpdateOperation,
+				Path:      "sign/stdkey",
+				Data: map[string]interface{}{
+					"public_key": publicKey4096,
+				},
+				ErrorOk: true,
+				Check: func(resp *logical.Response) error {
+					if resp.Data["error"] != "public_key failed to meet the key requirements: key is of an invalid size: 4096" {
+						return errors.New("a larger key (4096) was allowed, when the size was set for 2048")
+					}
+					return nil
+				},
+			},
+		},
+	}
+
+	logicaltest.Test(t, testCase)
+}
+
+func TestBackend_CustomKeyIDFormat(t *testing.T) {
+	config := logical.TestBackendConfig()
+
+	b, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Cannot create backend: %s", err)
+	}
+
+	testCase := logicaltest.TestCase{
+		LogicalBackend: b,
+		Steps: []logicaltest.TestStep{
+			configCaStep(),
+
+			createRoleStep("customrole", map[string]interface{}{
+				"key_type":                 "ca",
+				"key_id_format":            "{{role_name}}-{{token_display_name}}-{{public_key_hash}}",
+				"allowed_users":            "tuber",
+				"default_user":             "tuber",
+				"allow_user_certificates":  true,
+				"allowed_critical_options": "option,secondary",
+				"allowed_extensions":       "extension,additional",
+				"default_critical_options": map[string]interface{}{
+					"option": "value",
+				},
+				"default_extensions": map[string]interface{}{
+					"extension": "extended",
+				},
+			}),
+
+			signCertificateStep("customrole", "customrole-root-22608f5ef173aabf700797cb95c5641e792698ec6380e8e1eb55523e39aa5e51", ssh.UserCert, []string{"tuber"}, map[string]string{
+				"secondary": "value",
+			}, map[string]string{
+				"additional": "value",
+			}, 2*time.Hour, map[string]interface{}{
+				"public_key": publicKey2,
+				"ttl":        "2h",
+				"critical_options": map[string]interface{}{
+					"secondary": "value",
+				},
+				"extensions": map[string]interface{}{
+					"additional": "value",
+				},
+			}),
+		},
+	}
+
+	logicaltest.Test(t, testCase)
+}
+
+func TestBackend_DisallowUserProvidedKeyIDs(t *testing.T) {
+	config := logical.TestBackendConfig()
+
+	b, err := Factory(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Cannot create backend: %s", err)
+	}
+
+	testCase := logicaltest.TestCase{
+		LogicalBackend: b,
+		Steps: []logicaltest.TestStep{
+			configCaStep(),
+
+			createRoleStep("testing", map[string]interface{}{
+				"key_type":                "ca",
+				"allow_user_key_ids":      false,
+				"allow_user_certificates": true,
+			}),
+			logicaltest.TestStep{
+				Operation: logical.UpdateOperation,
+				Path:      "sign/testing",
+				Data: map[string]interface{}{
+					"public_key": publicKey2,
+					"key_id":     "override",
+				},
+				ErrorOk: true,
+				Check: func(resp *logical.Response) error {
+					if resp.Data["error"] != "setting key_id is not allowed by role" {
+						return errors.New("custom user key id was allowed even when 'allow_user_key_ids' is false")
+					}
+					return nil
+				},
+			},
+		},
+	}
+
+	logicaltest.Test(t, testCase)
+}
+
+func configCaStep() logicaltest.TestStep {
+	return logicaltest.TestStep{
+		Operation: logical.UpdateOperation,
+		Path:      "config/ca",
+		Data: map[string]interface{}{
+			"public_key":  publicKey,
+			"private_key": privateKey,
+		},
+	}
+}
+
+func createRoleStep(name string, parameters map[string]interface{}) logicaltest.TestStep {
+	return logicaltest.TestStep{
+		Operation: logical.CreateOperation,
+		Path:      "roles/" + name,
+		Data:      parameters,
+	}
+}
+
+func signCertificateStep(
+	role, keyID string, certType int, validPrincipals []string,
+	criticalOptionPermissions, extensionPermissions map[string]string,
+	ttl time.Duration,
+	requestParameters map[string]interface{}) logicaltest.TestStep {
+	return logicaltest.TestStep{
+		Operation: logical.UpdateOperation,
+		Path:      "sign/" + role,
+		Data:      requestParameters,
+
+		Check: func(resp *logical.Response) error {
+
+			serialNumber := resp.Data["serial_number"].(string)
+			if serialNumber == "" {
+				return errors.New("no serial number in response")
+			}
+
+			signedKey := strings.TrimSpace(resp.Data["signed_key"].(string))
+			if signedKey == "" {
+				return errors.New("no signed key in response")
+			}
+
+			key, _ := base64.StdEncoding.DecodeString(strings.Split(signedKey, " ")[1])
+
+			parsedKey, err := ssh.ParsePublicKey(key)
+			if err != nil {
+				return err
+			}
+
+			return validateSSHCertificate(parsedKey.(*ssh.Certificate), keyID, certType, validPrincipals, criticalOptionPermissions, extensionPermissions, ttl)
+		},
+	}
+}
+
+func validateSSHCertificate(cert *ssh.Certificate, keyID string, certType int, validPrincipals []string, criticalOptionPermissions, extensionPermissions map[string]string,
+	ttl time.Duration) error {
+
+	if cert.KeyId != keyID {
+		return fmt.Errorf("incorrect KeyId: %v, wanted %v", cert.KeyId, keyID)
+	}
+
+	if cert.CertType != uint32(certType) {
+		return fmt.Errorf("incorrect CertType: %v", cert.CertType)
+	}
+
+	if time.Unix(int64(cert.ValidAfter), 0).After(time.Now()) {
+		return fmt.Errorf("incorrect ValidAfter: %v", cert.ValidAfter)
+	}
+
+	if time.Unix(int64(cert.ValidBefore), 0).Before(time.Now()) {
+		return fmt.Errorf("incorrect ValidBefore: %v", cert.ValidBefore)
+	}
+
+	actualTTL := time.Unix(int64(cert.ValidBefore), 0).Add(-30 * time.Second).Sub(time.Unix(int64(cert.ValidAfter), 0))
+	if actualTTL != ttl {
+		return fmt.Errorf("incorrect ttl: expected: %v, actualL %v", ttl, actualTTL)
+	}
+
+	if !reflect.DeepEqual(cert.ValidPrincipals, validPrincipals) {
+		return fmt.Errorf("incorrect ValidPrincipals: expected: %#v actual: %#v", validPrincipals, cert.ValidPrincipals)
+	}
+
+	publicSigningKey, err := getSigningPublicKey()
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(cert.SignatureKey, publicSigningKey) {
+		return fmt.Errorf("incorrect SignatureKey: %v", cert.SignatureKey)
+	}
+
+	if cert.Signature == nil {
+		return fmt.Errorf("incorrect Signature: %v", cert.Signature)
+	}
+
+	if !reflect.DeepEqual(cert.Permissions.Extensions, extensionPermissions) {
+		return fmt.Errorf("incorrect Permissions.Extensions: Expected: %v, Actual: %v", extensionPermissions, cert.Permissions.Extensions)
+	}
+
+	if !reflect.DeepEqual(cert.Permissions.CriticalOptions, criticalOptionPermissions) {
+		return fmt.Errorf("incorrect Permissions.CriticalOptions: %v", cert.Permissions.CriticalOptions)
+	}
+
+	return nil
+}
+
+func getSigningPublicKey() (ssh.PublicKey, error) {
+	key, err := base64.StdEncoding.DecodeString(strings.Split(publicKey, " ")[1])
+	if err != nil {
+		return nil, err
+	}
+
+	parsedKey, err := ssh.ParsePublicKey(key)
+	if err != nil {
+		return nil, err
+	}
+
+	return parsedKey, nil
 }
 
 func testConfigZeroAddressDelete(t *testing.T) logicaltest.TestStep {
@@ -500,7 +1060,7 @@ func testVerifyWrite(t *testing.T, data map[string]interface{}, expected map[str
 			}
 
 			if !reflect.DeepEqual(ac, ex) {
-				return fmt.Errorf("Invalid response")
+				return fmt.Errorf("invalid response")
 			}
 			return nil
 		},
@@ -531,7 +1091,7 @@ func testLookupRead(t *testing.T, data map[string]interface{}, expected []string
 		Data:      data,
 		Check: func(resp *logical.Response) error {
 			if resp.Data == nil || resp.Data["roles"] == nil {
-				return fmt.Errorf("Missing roles information")
+				return fmt.Errorf("missing roles information")
 			}
 			if !reflect.DeepEqual(resp.Data["roles"].([]string), expected) {
 				return fmt.Errorf("Invalid response: \nactual:%#v\nexpected:%#v", resp.Data["roles"].([]string), expected)
@@ -546,6 +1106,25 @@ func testRoleWrite(t *testing.T, name string, data map[string]interface{}) logic
 		Operation: logical.UpdateOperation,
 		Path:      "roles/" + name,
 		Data:      data,
+	}
+}
+
+func testRoleList(t *testing.T, expected map[string]interface{}) logicaltest.TestStep {
+	return logicaltest.TestStep{
+		Operation: logical.ListOperation,
+		Path:      "roles",
+		Check: func(resp *logical.Response) error {
+			if resp == nil {
+				return fmt.Errorf("nil response")
+			}
+			if resp.Data == nil {
+				return fmt.Errorf("nil data")
+			}
+			if !reflect.DeepEqual(resp.Data, expected) {
+				return fmt.Errorf("Invalid response:\nactual:%#v\nexpected is %#v", resp.Data, expected)
+			}
+			return nil
+		},
 	}
 }
 
@@ -564,14 +1143,17 @@ func testRoleRead(t *testing.T, roleName string, expected map[string]interface{}
 			if err := mapstructure.Decode(resp.Data, &d); err != nil {
 				return fmt.Errorf("error decoding response:%s", err)
 			}
-			if roleName == testOTPRoleName {
+			switch d.KeyType {
+			case "otp":
 				if d.KeyType != expected["key_type"] || d.DefaultUser != expected["default_user"] || d.CIDRList != expected["cidr_list"] {
 					return fmt.Errorf("data mismatch. bad: %#v", resp)
 				}
-			} else {
+			case "dynamic":
 				if d.AdminUser != expected["admin_user"] || d.CIDRList != expected["cidr_list"] || d.KeyName != expected["key"] || d.KeyType != expected["key_type"] {
 					return fmt.Errorf("data mismatch. bad: %#v", resp)
 				}
+			default:
+				return fmt.Errorf("unknown key type. bad: %#v", resp)
 			}
 			return nil
 		},
@@ -606,7 +1188,7 @@ func testCredsWrite(t *testing.T, roleName string, data map[string]interface{}, 
 					return err
 				}
 				if len(e.Error) == 0 {
-					return fmt.Errorf("expected error, but write succeeded.")
+					return fmt.Errorf("expected error, but write succeeded")
 				}
 				return nil
 			}
@@ -618,22 +1200,30 @@ func testCredsWrite(t *testing.T, roleName string, data map[string]interface{}, 
 					return err
 				}
 				if d.Key == "" {
-					return fmt.Errorf("Generated key is an empty string")
+					return fmt.Errorf("generated key is an empty string")
 				}
 				// Checking only for a parsable key
 				_, err := ssh.ParsePrivateKey([]byte(d.Key))
 				if err != nil {
-					return fmt.Errorf("Generated key is invalid")
+					return fmt.Errorf("generated key is invalid")
 				}
 			} else {
 				if resp.Data["key_type"] != KeyTypeOTP {
-					return fmt.Errorf("Incorrect key_type")
+					return fmt.Errorf("incorrect key_type")
 				}
 				if resp.Data["key"] == nil {
-					return fmt.Errorf("Invalid key")
+					return fmt.Errorf("invalid key")
 				}
 			}
 			return nil
 		},
+	}
+}
+
+func testAccUserPrecheckFunc(t *testing.T) func() {
+	return func() {
+		if _, err := user.Lookup(testUserName); err != nil {
+			t.Skipf("Acceptance test skipped unless user %q is present", testUserName)
+		}
 	}
 }

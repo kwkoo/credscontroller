@@ -1,20 +1,22 @@
 package transit
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"reflect"
 	"testing"
 
-	"github.com/hashicorp/vault/logical"
+	"github.com/hashicorp/vault/sdk/logical"
 )
 
 func TestTransit_Random(t *testing.T) {
 	var b *backend
 	sysView := logical.TestSystemView()
 	storage := &logical.InmemStorage{}
+	sysView.CachingDisabledVal = true
 
-	b = Backend(&logical.BackendConfig{
+	b, _ = Backend(context.Background(), &logical.BackendConfig{
 		StorageView: storage,
 		System:      sysView,
 	})
@@ -28,7 +30,7 @@ func TestTransit_Random(t *testing.T) {
 
 	doRequest := func(req *logical.Request, errExpected bool, format string, numBytes int) {
 		getResponse := func() []byte {
-			resp, err := b.HandleRequest(req)
+			resp, err := b.HandleRequest(context.Background(), req)
 			if err != nil && !errExpected {
 				t.Fatal(err)
 			}
@@ -72,7 +74,7 @@ func TestTransit_Random(t *testing.T) {
 		}
 		rand2 := getResponse()
 		if len(rand1) != numBytes || len(rand2) != numBytes {
-			t.Fatal("length of output random bytes not what is exepcted")
+			t.Fatal("length of output random bytes not what is expected")
 		}
 		if reflect.DeepEqual(rand1, rand2) {
 			t.Fatal("found identical ouputs")
@@ -95,4 +97,9 @@ func TestTransit_Random(t *testing.T) {
 	req.Data["format"] = "hex"
 	req.Data["bytes"] = -1
 	doRequest(req, true, "", 0)
+
+	req.Data["format"] = "hex"
+	req.Data["bytes"] = maxBytes + 1
+	doRequest(req, true, "", 0)
+
 }
