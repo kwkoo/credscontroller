@@ -9,6 +9,8 @@ You need to have Vault and Vault-Controller installed as explained [here](../../
 Enable the kv secrets engine
 
 ```
+export VAULT_TOKEN=$ROOT_TOKEN
+
 vault secrets enable \
   -tls-skip-verify \
   -path=secret kv
@@ -17,8 +19,6 @@ vault secrets enable \
 Create a policy that allows the spring-example role to read only from the spring-example generic backend
 
 ```
-export VAULT_TOKEN=$ROOT_TOKEN
-
 vault policy write \
   -tls-skip-verify \
   spring-example \
