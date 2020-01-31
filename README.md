@@ -103,7 +103,7 @@ vault operator init \
 
 Save the generated key and token. 
 
-# Unseal Vault.
+# Unseal Vault
  
 You have to repeat this step every time you start vault. 
 
